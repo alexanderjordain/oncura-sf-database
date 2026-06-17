@@ -29,12 +29,13 @@ DB_LOCAL_OVERRIDE = os.environ.get("ONCURA_DB_PATH")
 def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_lite.db")
+    # Versioned filename so a schema change invalidates the cache automatically.
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v2.db")
     if os.path.exists(target) and os.path.getsize(target) > 50_000_000:
         return target
     import urllib.request
     info = st.empty()
-    info.info("Loading the Salesforce snapshot database… (first launch only, ~270 MB)")
+    info.info("Loading the Salesforce snapshot database… (first launch only, ~320 MB)")
     try:
         with urllib.request.urlopen(DB_URL) as r, open(target, "wb") as out:
             while True:
