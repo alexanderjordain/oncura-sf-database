@@ -30,24 +30,23 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v3.db")
-    MIN_BYTES = 380_000_000  # the v3 DB is ~392 MB; partials are unusable
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v4.db")
+    MIN_BYTES = 820_000_000  # the v4 DB is ~836 MB; partials are unusable
     if os.path.exists(target) and os.path.getsize(target) >= MIN_BYTES:
         # Sanity check: can SQLite open it + does it have the expected table?
         try:
             import sqlite3 as _sq
             _c = _sq.connect(target)
-            _c.execute("SELECT 1 FROM news_feed LIMIT 1")
+            _c.execute("SELECT 1 FROM feed_tracked_change LIMIT 1")
             _c.close()
             return target
         except Exception:
-            # Corrupt or stale — wipe and re-download
             try: os.remove(target)
             except Exception: pass
 
     import urllib.request, tempfile, shutil
     info = st.empty()
-    info.info("Loading the Salesforce snapshot database… (first launch only, ~390 MB)")
+    info.info("Loading the Salesforce snapshot database… (first launch only, ~840 MB — takes 1–2 min)")
     tmp = target + ".tmp"
     try:
         with urllib.request.urlopen(DB_URL) as r, open(tmp, "wb") as out:
@@ -908,11 +907,14 @@ def page_detail():
                 )
             st.html(''.join(cards))
 
-    # Chatter — FeedPost + NewsFeed + FeedComment timeline
+    # Chatter — FeedPost + NewsFeed + FeedComment timeline. For TrackedChange
+    # entries (auto-generated when a field changed), join FeedTrackedChange so we
+    # can show "Field X: 'Y' -> 'Z'" instead of empty body.
     with tabs[4]:
         try:
             chatter = q("""
-            SELECT 'Post' AS Kind, fp.Id, fp.Title AS Subj, fp.Body, fp.CreatedDate, u.Name AS Author
+            SELECT 'Post' AS Kind, fp.Id, fp.Title AS Subj, fp.Body, fp.CreatedDate,
+                   u.Name AS Author, NULL AS Field, NULL AS OldVal, NULL AS NewVal
             FROM feed_posts fp LEFT JOIN users u ON u.Id = fp.InsertedById
             WHERE fp.IsDeleted = 0 AND (
                 fp.ParentId = ?
@@ -920,20 +922,26 @@ def page_detail():
                 OR fp.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
             )
             UNION ALL
-            SELECT 'NewsFeed', nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name
-            FROM news_feed nf LEFT JOIN users u ON u.Id = nf.InsertedById
+            SELECT
+                CASE WHEN nf.Type = 'TrackedChange' THEN 'Tracked change' ELSE 'NewsFeed' END,
+                nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name,
+                ftc.FieldName, ftc.OldValue, ftc.NewValue
+            FROM news_feed nf
+            LEFT JOIN users u ON u.Id = nf.InsertedById
+            LEFT JOIN feed_tracked_change ftc ON ftc.FeedItemId = nf.Id
             WHERE nf.ParentId = ?
                OR nf.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
                OR nf.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
             UNION ALL
-            SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name
+            SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name,
+                   NULL, NULL, NULL
             FROM feed_comments fc LEFT JOIN users u ON u.Id = fc.InsertedById
             WHERE fc.IsDeleted = 0 AND (
                 fc.ParentId = ?
                 OR fc.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
                 OR fc.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
             )
-            ORDER BY CreatedDate DESC LIMIT 300
+            ORDER BY CreatedDate DESC LIMIT 500
             """, (aid,)*9)
         except Exception:
             chatter = None
@@ -950,12 +958,20 @@ def page_detail():
                 body = _safe(c.get("Body"), "")
                 author = _safe(c.get("Author"), "Unknown")
                 created = _safe(c.get("CreatedDate"), "")[:10]
+                field = _safe(c.get("Field"), "")
+                old_v = _safe(c.get("OldVal"), "")
+                new_v = _safe(c.get("NewVal"), "")
+                # For TrackedChange rows, the human-readable detail is in field/old/new
+                if kind == "Tracked change" and field:
+                    subj_html = f"{_html.escape(field)}: {_html.escape(old_v) or '—'} &rarr; {_html.escape(new_v) or '—'}"
+                else:
+                    subj_html = _html.escape(subj or "(no title)")[:200]
                 body_plain = (body or "").replace("<br>", "\n").replace("<br/>", "\n")
                 rows_html.append(
                     f'<div class="timeline-row">'
                     f'<div class="timeline-date">{_html.escape(created) or "—"}</div>'
                     f'<div class="timeline-card">'
-                    f'<div class="timeline-subject">{_html.escape(subj or "(no title)")[:200]}</div>'
+                    f'<div class="timeline-subject">{subj_html}</div>'
                     f'<div class="timeline-meta">{_html.escape(kind)} &middot; {_html.escape(author)}</div>'
                     f'<div style="margin-top:.4rem; font-family:var(--sans); font-size:.9rem; color:var(--ink); white-space:pre-wrap;">{_html.escape(body_plain)[:1500]}</div>'
                     f'</div></div>'
