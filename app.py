@@ -31,18 +31,37 @@ def _resolve_db_path() -> str:
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
     target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v3.db")
-    if os.path.exists(target) and os.path.getsize(target) > 50_000_000:
-        return target
-    import urllib.request
+    MIN_BYTES = 380_000_000  # the v3 DB is ~392 MB; partials are unusable
+    if os.path.exists(target) and os.path.getsize(target) >= MIN_BYTES:
+        # Sanity check: can SQLite open it + does it have the expected table?
+        try:
+            import sqlite3 as _sq
+            _c = _sq.connect(target)
+            _c.execute("SELECT 1 FROM news_feed LIMIT 1")
+            _c.close()
+            return target
+        except Exception:
+            # Corrupt or stale — wipe and re-download
+            try: os.remove(target)
+            except Exception: pass
+
+    import urllib.request, tempfile, shutil
     info = st.empty()
     info.info("Loading the Salesforce snapshot database… (first launch only, ~390 MB)")
+    tmp = target + ".tmp"
     try:
-        with urllib.request.urlopen(DB_URL) as r, open(target, "wb") as out:
+        with urllib.request.urlopen(DB_URL) as r, open(tmp, "wb") as out:
             while True:
                 chunk = r.read(1 << 20)
                 if not chunk: break
                 out.write(chunk)
+        # Verify size before promoting to final path
+        if os.path.getsize(tmp) < MIN_BYTES:
+            raise RuntimeError(f"download incomplete: only {os.path.getsize(tmp):,} bytes")
+        shutil.move(tmp, target)
     except Exception as e:
+        try: os.remove(tmp)
+        except Exception: pass
         info.error(f"Failed to fetch the database: {e}")
         raise
     info.empty()
