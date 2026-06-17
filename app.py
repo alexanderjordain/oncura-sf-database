@@ -931,10 +931,15 @@ def page_detail():
 
     # History
     with tabs[6]:
-        df = q("SELECT CreatedDate, Field, OldValue, NewValue, CreatedById FROM account_history WHERE AccountId=? ORDER BY CreatedDate DESC LIMIT 500", (aid,))
-        st.caption(f":gray[{len(df):,} history changes · most recent 500]")
-        if df.empty: st.markdown(":gray[—]")
+        try:
+            df = q("SELECT CreatedDate, Field, OldValue, NewValue, CreatedById FROM account_history WHERE AccountId=? ORDER BY CreatedDate DESC LIMIT 500", (aid,))
+        except Exception:
+            df = None
+        if df is None or df.empty:
+            st.caption(":gray[No history data in this snapshot.]")
+            st.markdown(":gray[—]")
         else:
+            st.caption(f":gray[{len(df):,} history changes · most recent 500]")
             df["CreatedDate"] = df["CreatedDate"].str.slice(0, 19)
             st.dataframe(
                 df.rename(columns={"CreatedById": "By"}),
