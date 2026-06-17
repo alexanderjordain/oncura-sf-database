@@ -652,7 +652,7 @@ def page_detail():
     )
     st.html(highlights_html)
 
-    tabs = st.tabs(["Contacts", "Opportunities", "Activities", "Events", "Cases", "History", "Files"])
+    tabs = st.tabs(["Contacts", "Opportunities", "Activities", "Notes", "Events", "Cases", "History", "Files"])
 
     # Contacts — Salesforce-style cards
     with tabs[0]:
@@ -826,8 +826,70 @@ def page_detail():
                     if desc:
                         st.text(desc)
 
-    # Events
+    # Notes (legacy SF Note object — prospecting notes by Jaclyn, Sarah, etc.)
     with tabs[3]:
+        # Gather notes whose ParentId is the account, any contact of the account,
+        # or any opportunity of the account. Use OwnerId for author (CreatedById
+        # in this org is a legacy migration user on most rows).
+        notes_df = q("""
+        SELECT n.Id, n.Title, n.Body, n.CreatedDate, n.OwnerId,
+               u.Name AS AuthorName, n.ParentId
+        FROM notes n
+        LEFT JOIN users u ON u.Id = n.OwnerId
+        WHERE n.IsDeleted = 0 AND (
+            n.ParentId = ?
+            OR n.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+            OR n.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+        )
+        ORDER BY n.CreatedDate DESC
+        """, (aid, aid, aid))
+
+        author_counts = q("""
+        SELECT COALESCE(u.Name, '(unknown)') AS AuthorName, COUNT(*) AS n
+        FROM notes n
+        LEFT JOIN users u ON u.Id = n.OwnerId
+        WHERE n.IsDeleted = 0 AND (
+            n.ParentId = ?
+            OR n.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+            OR n.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+        )
+        GROUP BY AuthorName
+        ORDER BY n DESC
+        """, (aid, aid, aid))
+
+        st.caption(f":gray[{len(notes_df):,} notes (by Jaclyn, Sarah, and other reps over the clinic's lifetime)]")
+        if notes_df.empty:
+            st.markdown(":gray[No notes on this clinic.]")
+        else:
+            authors = ["All authors"] + [f"{r['AuthorName']} ({r['n']})" for _, r in author_counts.iterrows() if r['AuthorName']]
+            choice = st.selectbox("Filter by author", authors, key=f"note_author_{aid}", label_visibility="collapsed")
+            if choice != "All authors":
+                target = choice.rsplit(" (", 1)[0]
+                notes_df = notes_df[notes_df["AuthorName"] == target]
+
+            import html as _html
+            cards = []
+            for _, n in notes_df.iterrows():
+                title = _safe(n.get("Title"), "")
+                body  = _safe(n.get("Body"), "")
+                author = _safe(n.get("AuthorName"), "Unknown")
+                created = _safe(n.get("CreatedDate"), "")[:10]
+                # Note bodies can be plain or rich text — strip basic HTML for display
+                body_plain = (body or "").replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+                # Render as a card
+                cards.append(
+                    f'<div class="timeline-row">'
+                    f'<div class="timeline-date">{_html.escape(created) or "—"}</div>'
+                    f'<div class="timeline-card">'
+                    f'<div class="timeline-subject">{_html.escape(title) if title else "(untitled note)"}</div>'
+                    f'<div class="timeline-meta">by {_html.escape(author)}</div>'
+                    f'<div style="margin-top:.5rem; font-family:var(--sans); font-size:.92rem; color:var(--ink); white-space:pre-wrap;">{_html.escape(body_plain)[:2000]}</div>'
+                    f'</div></div>'
+                )
+            st.html(''.join(cards))
+
+    # Events
+    with tabs[4]:
         df = q("""
         SELECT ActivityDate, Subject, StartDateTime, Description, OwnerId
         FROM events WHERE AccountId=? OR WhatId=?
@@ -849,7 +911,7 @@ def page_detail():
             )
 
     # Cases
-    with tabs[4]:
+    with tabs[5]:
         df = q("SELECT CaseNumber, Subject, Status, Priority, CreatedDate, ClosedDate FROM cases WHERE AccountId=? ORDER BY CreatedDate DESC", (aid,))
         st.caption(f":gray[{len(df):,} cases]")
         if df.empty: st.markdown(":gray[—]")
@@ -867,7 +929,7 @@ def page_detail():
             )
 
     # History
-    with tabs[5]:
+    with tabs[6]:
         df = q("SELECT CreatedDate, Field, OldValue, NewValue, CreatedById FROM account_history WHERE AccountId=? ORDER BY CreatedDate DESC LIMIT 500", (aid,))
         st.caption(f":gray[{len(df):,} history changes · most recent 500]")
         if df.empty: st.markdown(":gray[—]")
@@ -886,40 +948,48 @@ def page_detail():
             )
 
     # Files
-    with tabs[6]:
-        df_acct = q("SELECT file_name, size_bytes, path FROM files WHERE parent_id=?", (aid,))
-        task_files = q("""
-        SELECT f.file_name, f.size_bytes, f.path
-        FROM files f
-        WHERE f.parent_type='Task' AND f.parent_id IN (
-            SELECT Id FROM tasks WHERE AccountId=? OR WhatId=?
-        )
-        """, (aid, aid))
-        total = len(df_acct) + len(task_files)
-        st.caption(f":gray[{total:,} backed-up files]")
-        if df_acct.empty and task_files.empty:
-            st.markdown(":gray[—]")
-            st.info(":material/info: The SF backup did not include files attached to Opportunities. POs, signed quotes, and contracts that lived on Opp records are not recoverable from this snapshot.")
+    with tabs[7]:
+        # Files tied to this clinic via ContentDocumentLink:
+        # - Direct on Account
+        # - Files on any Opportunity of this account
+        # - Files on any Contact of this account
+        # - Files on any Task tied to this account
+        files_df = q("""
+        SELECT fb.content_version_id, fb.parent_id, fb.parent_type,
+               fb.title, fb.extension, fb.size_bytes, fb.is_inline, fb.blob_path
+        FROM file_blobs fb
+        WHERE fb.parent_id = ?
+           OR fb.parent_id IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+           OR fb.parent_id IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+           OR fb.parent_id IN (SELECT Id FROM tasks WHERE AccountId = ? OR WhatId = ?)
+        ORDER BY fb.is_inline DESC, fb.title COLLATE NOCASE
+        """, (aid, aid, aid, aid, aid))
+        st.caption(f":gray[{len(files_df):,} files in the Salesforce backup]")
+        if files_df.empty:
+            st.markdown(":gray[No files on this clinic in the backup.]")
         else:
-            file_col_cfg = {
-                "File":       st.column_config.TextColumn(width="large"),
-                "Size (KB)":  st.column_config.NumberColumn(format="%.1f", width="small"),
-                "Path":       st.column_config.TextColumn(width="large"),
-            }
-            if not df_acct.empty:
-                st.markdown(":gray[**On the Account record**]")
-                df_acct["Size (KB)"] = (df_acct["size_bytes"]/1024).round(1)
-                st.dataframe(
-                    df_acct[["file_name", "Size (KB)", "path"]].rename(columns={"file_name": "File", "path": "Path"}),
-                    use_container_width=True, hide_index=True, column_config=file_col_cfg,
-                )
-            if not task_files.empty:
-                st.markdown(":gray[**On Tasks tied to this clinic**]")
-                task_files["Size (KB)"] = (task_files["size_bytes"]/1024).round(1)
-                st.dataframe(
-                    task_files[["file_name", "Size (KB)", "path"]].rename(columns={"file_name": "File", "path": "Path"}),
-                    use_container_width=True, hide_index=True, column_config=file_col_cfg,
-                )
+            for _, f in files_df.iterrows():
+                title = _safe(f.get("title"), "(untitled)")
+                ext = _safe(f.get("extension"), "")
+                size_kb = (f.get("size_bytes") or 0) / 1024
+                size_str = f"{size_kb:,.0f} KB" if size_kb < 1024 else f"{size_kb/1024:,.1f} MB"
+                parent_type = f.get("parent_type") or ""
+                parent_label = {"001": "Account", "003": "Contact", "006": "Opportunity", "00T": "Task", "002": "Note"}.get(parent_type, parent_type)
+                col_main, col_action = st.columns([5, 1])
+                col_main.markdown(f"**{title}.{ext}** · :gray[{size_str} · {parent_label}]")
+                if f.get("is_inline") and f.get("content_version_id"):
+                    # Pull the blob bytes from the DB on demand
+                    blob_row = one("SELECT blob FROM file_blobs WHERE content_version_id=?", (f.get("content_version_id"),))
+                    if blob_row and blob_row.get("blob"):
+                        col_action.download_button(
+                            "Download",
+                            data=blob_row["blob"],
+                            file_name=f"{title}.{ext}",
+                            key=f"dl_{f.get('content_version_id')}",
+                            use_container_width=True,
+                        )
+                else:
+                    col_action.caption(":gray[Stored on Seagate]")
 
 # ───────────────────── PAGE: Sales activity ─────────────────────
 def page_activity():
