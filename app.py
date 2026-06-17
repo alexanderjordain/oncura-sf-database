@@ -30,14 +30,14 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v4.db")
-    MIN_BYTES = 820_000_000  # the v4 DB is ~836 MB; partials are unusable
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v5.db")
+    MIN_BYTES = 940_000_000  # the v5 DB is ~954 MB; partials are unusable
     if os.path.exists(target) and os.path.getsize(target) >= MIN_BYTES:
-        # Sanity check: can SQLite open it + does it have the expected table?
+        # Sanity check: can SQLite open it + does it have the expected column?
         try:
             import sqlite3 as _sq
             _c = _sq.connect(target)
-            _c.execute("SELECT 1 FROM feed_tracked_change LIMIT 1")
+            _c.execute("SELECT release_bucket FROM file_blobs LIMIT 1")
             _c.close()
             return target
         except Exception:
@@ -46,7 +46,7 @@ def _resolve_db_path() -> str:
 
     import urllib.request, tempfile, shutil
     info = st.empty()
-    info.info("Loading the Salesforce snapshot database… (first launch only, ~840 MB — takes 1–2 min)")
+    info.info("Loading the Salesforce snapshot database… (first launch only, ~954 MB — takes 1–2 min)")
     tmp = target + ".tmp"
     try:
         with urllib.request.urlopen(DB_URL) as r, open(tmp, "wb") as out:
@@ -978,19 +978,25 @@ def page_detail():
                 )
             st.html(''.join(rows_html))
 
-    # Emails — list email sends per clinic via contact membership
+    # Emails — list email sends per clinic. Match by RecipientId = contact.Id
+    # OR by EmailAddress = contact.Email (case-insensitive) so we catch lead-only
+    # recipients with no contact ID.
     with tabs[5]:
         try:
             emails_df = q("""
-            SELECT le.Subject, le.Name AS CampaignName, le.Status, le.CreatedDate,
-                   les.FirstOpenDate, les.FirstClickDate, les.Unsubscribed,
-                   c.Name AS ContactName, c.Email AS ContactEmail
+            SELECT le.Subject, le.Name AS CampaignName, le.Status,
+                   les.CreatedDate AS Sent, les.Result, les.EmailAddress AS ToEmail,
+                   c.Name AS ContactName
             FROM list_email_sent les
-            JOIN list_email le ON le.Id = les.ListEmailId
-            LEFT JOIN contacts c ON c.Id = les.ContactId
-            WHERE les.ContactId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-            ORDER BY le.CreatedDate DESC LIMIT 200
-            """, (aid,))
+            LEFT JOIN list_email le ON le.Id = les.ListEmailId
+            LEFT JOIN contacts c ON c.Id = les.RecipientId
+            WHERE les.RecipientId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+               OR LOWER(les.EmailAddress) IN (
+                   SELECT LOWER(Email) FROM contacts
+                   WHERE AccountId = ? AND IsDeleted = 0 AND Email IS NOT NULL AND Email != ''
+               )
+            ORDER BY les.CreatedDate DESC LIMIT 300
+            """, (aid, aid))
         except Exception:
             emails_df = None
         if emails_df is None or emails_df.empty:
@@ -998,36 +1004,36 @@ def page_detail():
             st.markdown(":gray[—]")
         else:
             st.caption(f":gray[{len(emails_df):,} marketing emails sent to contacts at this clinic]")
-            disp = emails_df.copy()
-            disp["Opened"]    = disp["FirstOpenDate"].notna().map({True: "Yes", False: ""})
-            disp["Clicked"]   = disp["FirstClickDate"].notna().map({True: "Yes", False: ""})
-            disp["Unsub"]     = disp["Unsubscribed"].map({1: "Yes", 0: ""})
-            disp = disp[["CreatedDate", "Subject", "ContactName", "Opened", "Clicked", "Unsub"]]
-            disp = disp.rename(columns={"CreatedDate": "Sent", "ContactName": "To"})
+            disp = emails_df.rename(columns={"CampaignName":"Campaign","ToEmail":"To","ContactName":"Contact"})
             st.dataframe(
-                disp, use_container_width=True, hide_index=True,
+                disp[["Sent","Subject","Campaign","To","Contact","Result"]],
+                use_container_width=True, hide_index=True,
                 column_config={
-                    "Sent":    st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                    "Subject": st.column_config.TextColumn(width="large"),
-                    "To":      st.column_config.TextColumn(width="medium"),
-                    "Opened":  st.column_config.TextColumn(width="small"),
-                    "Clicked": st.column_config.TextColumn(width="small"),
-                    "Unsub":   st.column_config.TextColumn(width="small"),
+                    "Sent":     st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                    "Subject":  st.column_config.TextColumn(width="large"),
+                    "Campaign": st.column_config.TextColumn(width="medium"),
+                    "To":       st.column_config.TextColumn(width="medium"),
+                    "Contact":  st.column_config.TextColumn(width="medium"),
+                    "Result":   st.column_config.TextColumn(width="small"),
                 },
             )
 
-    # Demos — Calendly bookings
+    # Demos — Calendly bookings. Match by invitee email (the only link to a clinic).
     with tabs[6]:
         try:
             demos_df = q("""
-            SELECT EventType, EventStartTime, InviteeName, InviteeEmail, Status,
-                   u.Name AS AssignedTo, ca.CreatedDate
-            FROM calendly_actions ca LEFT JOIN users u ON u.Id = ca.AssignedTo
-            WHERE ca.AccountId = ?
-               OR ca.OpportunityId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-               OR ca.ContactId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-            ORDER BY ca.EventStartTime DESC LIMIT 100
-            """, (aid, aid, aid))
+            SELECT ca.EventStartTime, ca.EventTypeName, ca.EventSubject,
+                   ca.InviteeName, ca.InviteeEmail,
+                   ca.PublisherName AS Rep, ca.Location,
+                   CASE WHEN ca.EventCanceled=1 OR ca.InviteeCanceled=1 THEN 'Canceled' ELSE 'Scheduled' END AS Status,
+                   ca.CancelReason
+            FROM calendly_actions ca
+            WHERE LOWER(ca.InviteeEmail) IN (
+                SELECT LOWER(Email) FROM contacts
+                WHERE AccountId = ? AND IsDeleted = 0 AND Email IS NOT NULL AND Email != ''
+            )
+            ORDER BY ca.EventStartTime DESC LIMIT 200
+            """, (aid,))
         except Exception:
             demos_df = None
         if demos_df is None or demos_df.empty:
@@ -1035,8 +1041,9 @@ def page_detail():
             st.markdown(":gray[—]")
         else:
             st.caption(f":gray[{len(demos_df):,} Calendly bookings]")
+            disp = demos_df.rename(columns={"EventStartTime":"When","EventTypeName":"Type","EventSubject":"Subject","InviteeName":"Invitee","InviteeEmail":"Email"})
             st.dataframe(
-                demos_df.rename(columns={"EventStartTime":"When","EventType":"Type","AssignedTo":"Rep"}),
+                disp[["When","Type","Subject","Invitee","Email","Rep","Status","Location"]],
                 use_container_width=True, hide_index=True,
             )
 
@@ -1136,7 +1143,7 @@ def page_detail():
         # - Files on any Task tied to this account
         files_df = q("""
         SELECT fb.content_version_id, fb.parent_id, fb.parent_type,
-               fb.title, fb.extension, fb.size_bytes, fb.is_inline, fb.blob_path
+               fb.title, fb.extension, fb.size_bytes, fb.is_inline, fb.release_bucket
         FROM file_blobs fb
         WHERE fb.parent_id = ?
            OR fb.parent_id IN (SELECT Id FROM opportunities WHERE AccountId = ?)
@@ -1145,19 +1152,22 @@ def page_detail():
         ORDER BY fb.is_inline DESC, fb.title COLLATE NOCASE
         """, (aid, aid, aid, aid, aid))
         st.caption(f":gray[{len(files_df):,} files in the Salesforce backup]")
+        RELEASE_BASE = "https://github.com/alexanderjordain/oncura-sf-database/releases/download/files-2026-03-25-"
         if files_df.empty:
             st.markdown(":gray[No files on this clinic in the backup.]")
         else:
             for _, f in files_df.iterrows():
                 title = _safe(f.get("title"), "(untitled)")
-                ext = _safe(f.get("extension"), "")
+                ext = _safe(f.get("extension"), "bin") or "bin"
+                cv_id = f.get("content_version_id")
+                bucket = f.get("release_bucket") or "a"
                 size_kb = (f.get("size_bytes") or 0) / 1024
                 size_str = f"{size_kb:,.0f} KB" if size_kb < 1024 else f"{size_kb/1024:,.1f} MB"
                 parent_type = f.get("parent_type") or ""
                 parent_label = {"001": "Account", "003": "Contact", "006": "Opportunity", "00T": "Task", "002": "Note"}.get(parent_type, parent_type)
                 col_main, col_action = st.columns([5, 1])
                 col_main.markdown(f"**{title}.{ext}** · :gray[{size_str} · {parent_label}]")
-                col_action.caption(":gray[Stored on backup drive]")
+                col_action.link_button("Download", f"{RELEASE_BASE}{bucket}/{cv_id}.{ext}", use_container_width=True)
 
 # ───────────────────── PAGE: Sales activity ─────────────────────
 def page_activity():
