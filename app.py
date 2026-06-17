@@ -1141,19 +1141,7 @@ def page_detail():
                 parent_label = {"001": "Account", "003": "Contact", "006": "Opportunity", "00T": "Task", "002": "Note"}.get(parent_type, parent_type)
                 col_main, col_action = st.columns([5, 1])
                 col_main.markdown(f"**{title}.{ext}** · :gray[{size_str} · {parent_label}]")
-                if f.get("is_inline") and f.get("content_version_id"):
-                    # Pull the blob bytes from the DB on demand
-                    blob_row = one("SELECT blob FROM file_blobs WHERE content_version_id=?", (f.get("content_version_id"),))
-                    if blob_row and blob_row.get("blob"):
-                        col_action.download_button(
-                            "Download",
-                            data=blob_row["blob"],
-                            file_name=f"{title}.{ext}",
-                            key=f"dl_{f.get('content_version_id')}",
-                            use_container_width=True,
-                        )
-                else:
-                    col_action.caption(":gray[Stored on Seagate]")
+                col_action.caption(":gray[Stored on backup drive]")
 
 # ───────────────────── PAGE: Sales activity ─────────────────────
 def page_activity():
