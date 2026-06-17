@@ -30,12 +30,12 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v2.db")
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v3.db")
     if os.path.exists(target) and os.path.getsize(target) > 50_000_000:
         return target
     import urllib.request
     info = st.empty()
-    info.info("Loading the Salesforce snapshot database… (first launch only, ~320 MB)")
+    info.info("Loading the Salesforce snapshot database… (first launch only, ~390 MB)")
     try:
         with urllib.request.urlopen(DB_URL) as r, open(target, "wb") as out:
             while True:
@@ -653,7 +653,7 @@ def page_detail():
     )
     st.html(highlights_html)
 
-    tabs = st.tabs(["Contacts", "Opportunities", "Activities", "Notes", "Events", "Cases", "History", "Files"])
+    tabs = st.tabs(["Contacts", "Opportunities", "Activities", "Notes", "Chatter", "Emails", "Demos", "Quotes", "Events", "Cases", "History", "Files"])
 
     # Contacts — Salesforce-style cards
     with tabs[0]:
@@ -889,8 +889,147 @@ def page_detail():
                 )
             st.html(''.join(cards))
 
-    # Events
+    # Chatter — FeedPost + NewsFeed + FeedComment timeline
     with tabs[4]:
+        try:
+            chatter = q("""
+            SELECT 'Post' AS Kind, fp.Id, fp.Title AS Subj, fp.Body, fp.CreatedDate, u.Name AS Author
+            FROM feed_posts fp LEFT JOIN users u ON u.Id = fp.InsertedById
+            WHERE fp.IsDeleted = 0 AND (
+                fp.ParentId = ?
+                OR fp.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                OR fp.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+            )
+            UNION ALL
+            SELECT 'NewsFeed', nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name
+            FROM news_feed nf LEFT JOIN users u ON u.Id = nf.InsertedById
+            WHERE nf.ParentId = ?
+               OR nf.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+               OR nf.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+            UNION ALL
+            SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name
+            FROM feed_comments fc LEFT JOIN users u ON u.Id = fc.InsertedById
+            WHERE fc.IsDeleted = 0 AND (
+                fc.ParentId = ?
+                OR fc.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                OR fc.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+            )
+            ORDER BY CreatedDate DESC LIMIT 300
+            """, (aid,)*9)
+        except Exception:
+            chatter = None
+        if chatter is None or chatter.empty:
+            st.caption(":gray[No Chatter activity in the snapshot.]")
+            st.markdown(":gray[—]")
+        else:
+            st.caption(f":gray[{len(chatter):,} Chatter entries (posts, news feed, comments)]")
+            import html as _html
+            rows_html = []
+            for _, c in chatter.iterrows():
+                kind = _safe(c.get("Kind"), "")
+                subj = _safe(c.get("Subj"), "")
+                body = _safe(c.get("Body"), "")
+                author = _safe(c.get("Author"), "Unknown")
+                created = _safe(c.get("CreatedDate"), "")[:10]
+                body_plain = (body or "").replace("<br>", "\n").replace("<br/>", "\n")
+                rows_html.append(
+                    f'<div class="timeline-row">'
+                    f'<div class="timeline-date">{_html.escape(created) or "—"}</div>'
+                    f'<div class="timeline-card">'
+                    f'<div class="timeline-subject">{_html.escape(subj or "(no title)")[:200]}</div>'
+                    f'<div class="timeline-meta">{_html.escape(kind)} &middot; {_html.escape(author)}</div>'
+                    f'<div style="margin-top:.4rem; font-family:var(--sans); font-size:.9rem; color:var(--ink); white-space:pre-wrap;">{_html.escape(body_plain)[:1500]}</div>'
+                    f'</div></div>'
+                )
+            st.html(''.join(rows_html))
+
+    # Emails — list email sends per clinic via contact membership
+    with tabs[5]:
+        try:
+            emails_df = q("""
+            SELECT le.Subject, le.Name AS CampaignName, le.Status, le.CreatedDate,
+                   les.FirstOpenDate, les.FirstClickDate, les.Unsubscribed,
+                   c.Name AS ContactName, c.Email AS ContactEmail
+            FROM list_email_sent les
+            JOIN list_email le ON le.Id = les.ListEmailId
+            LEFT JOIN contacts c ON c.Id = les.ContactId
+            WHERE les.ContactId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+            ORDER BY le.CreatedDate DESC LIMIT 200
+            """, (aid,))
+        except Exception:
+            emails_df = None
+        if emails_df is None or emails_df.empty:
+            st.caption(":gray[No list-email sends recorded for this clinic.]")
+            st.markdown(":gray[—]")
+        else:
+            st.caption(f":gray[{len(emails_df):,} marketing emails sent to contacts at this clinic]")
+            disp = emails_df.copy()
+            disp["Opened"]    = disp["FirstOpenDate"].notna().map({True: "Yes", False: ""})
+            disp["Clicked"]   = disp["FirstClickDate"].notna().map({True: "Yes", False: ""})
+            disp["Unsub"]     = disp["Unsubscribed"].map({1: "Yes", 0: ""})
+            disp = disp[["CreatedDate", "Subject", "ContactName", "Opened", "Clicked", "Unsub"]]
+            disp = disp.rename(columns={"CreatedDate": "Sent", "ContactName": "To"})
+            st.dataframe(
+                disp, use_container_width=True, hide_index=True,
+                column_config={
+                    "Sent":    st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                    "Subject": st.column_config.TextColumn(width="large"),
+                    "To":      st.column_config.TextColumn(width="medium"),
+                    "Opened":  st.column_config.TextColumn(width="small"),
+                    "Clicked": st.column_config.TextColumn(width="small"),
+                    "Unsub":   st.column_config.TextColumn(width="small"),
+                },
+            )
+
+    # Demos — Calendly bookings
+    with tabs[6]:
+        try:
+            demos_df = q("""
+            SELECT EventType, EventStartTime, InviteeName, InviteeEmail, Status,
+                   u.Name AS AssignedTo, ca.CreatedDate
+            FROM calendly_actions ca LEFT JOIN users u ON u.Id = ca.AssignedTo
+            WHERE ca.AccountId = ?
+               OR ca.OpportunityId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+               OR ca.ContactId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+            ORDER BY ca.EventStartTime DESC LIMIT 100
+            """, (aid, aid, aid))
+        except Exception:
+            demos_df = None
+        if demos_df is None or demos_df.empty:
+            st.caption(":gray[No Calendly bookings for this clinic.]")
+            st.markdown(":gray[—]")
+        else:
+            st.caption(f":gray[{len(demos_df):,} Calendly bookings]")
+            st.dataframe(
+                demos_df.rename(columns={"EventStartTime":"When","EventType":"Type","AssignedTo":"Rep"}),
+                use_container_width=True, hide_index=True,
+            )
+
+    # Quotes
+    with tabs[7]:
+        try:
+            quotes_df = q("""
+            SELECT q.Name, q.QuoteNumber, q.Status, q.TotalPrice, q.ExpirationDate,
+                   q.CreatedDate, u.Name AS CreatedBy
+            FROM quotes q LEFT JOIN users u ON u.Id = q.CreatedById
+            WHERE q.AccountId = ? OR q.OpportunityId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+            ORDER BY q.CreatedDate DESC
+            """, (aid, aid))
+        except Exception:
+            quotes_df = None
+        if quotes_df is None or quotes_df.empty:
+            st.caption(":gray[No SF Quotes on this clinic.]")
+            st.markdown(":gray[—]")
+        else:
+            st.caption(f":gray[{len(quotes_df):,} quotes]")
+            disp = quotes_df.rename(columns={"QuoteNumber":"Quote #","TotalPrice":"Total","ExpirationDate":"Expires","CreatedDate":"Created","CreatedBy":"By"})
+            st.dataframe(
+                disp, use_container_width=True, hide_index=True,
+                column_config={"Total": st.column_config.NumberColumn(format="$%d", width="small")},
+            )
+
+    # Events
+    with tabs[8]:
         df = q("""
         SELECT ActivityDate, Subject, StartDateTime, Description, OwnerId
         FROM events WHERE AccountId=? OR WhatId=?
@@ -912,7 +1051,7 @@ def page_detail():
             )
 
     # Cases
-    with tabs[5]:
+    with tabs[9]:
         df = q("SELECT CaseNumber, Subject, Status, Priority, CreatedDate, ClosedDate FROM cases WHERE AccountId=? ORDER BY CreatedDate DESC", (aid,))
         st.caption(f":gray[{len(df):,} cases]")
         if df.empty: st.markdown(":gray[—]")
@@ -930,7 +1069,7 @@ def page_detail():
             )
 
     # History
-    with tabs[6]:
+    with tabs[10]:
         try:
             df = q("SELECT CreatedDate, Field, OldValue, NewValue, CreatedById FROM account_history WHERE AccountId=? ORDER BY CreatedDate DESC LIMIT 500", (aid,))
         except Exception:
@@ -954,7 +1093,7 @@ def page_detail():
             )
 
     # Files
-    with tabs[7]:
+    with tabs[11]:
         # Files tied to this clinic via ContentDocumentLink:
         # - Direct on Account
         # - Files on any Opportunity of this account
