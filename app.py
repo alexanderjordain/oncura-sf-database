@@ -30,14 +30,15 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v5.db")
-    MIN_BYTES = 940_000_000  # the v5 DB is ~954 MB; partials are unusable
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v6.db")
+    MIN_BYTES = 940_000_000  # the v6 DB is ~958 MB; partials are unusable
     if os.path.exists(target) and os.path.getsize(target) >= MIN_BYTES:
-        # Sanity check: can SQLite open it + does it have the expected column?
+        # Sanity check: can SQLite open it + does it have the expected columns?
         try:
             import sqlite3 as _sq
             _c = _sq.connect(target)
-            _c.execute("SELECT release_bucket FROM file_blobs LIMIT 1")
+            _c.execute("SELECT AccountId FROM attachments LIMIT 1")
+            _c.execute("SELECT 1 FROM maps_routes LIMIT 1")
             _c.close()
             return target
         except Exception:
@@ -46,7 +47,7 @@ def _resolve_db_path() -> str:
 
     import urllib.request, tempfile, shutil
     info = st.empty()
-    info.info("Loading the Salesforce snapshot database… (first launch only, ~954 MB — takes 1–2 min)")
+    info.info("Loading the Salesforce snapshot database… (first launch only, ~960 MB — takes 1–2 min)")
     tmp = target + ".tmp"
     try:
         with urllib.request.urlopen(DB_URL) as r, open(tmp, "wb") as out:
@@ -671,7 +672,9 @@ def page_detail():
     )
     st.html(highlights_html)
 
-    tabs = st.tabs(["Contacts", "Opportunities", "Activities", "Notes", "Chatter", "Emails", "Demos", "Quotes", "Events", "Cases", "History", "Files"])
+    tabs = st.tabs(["Contacts", "Opportunities", "Activities", "Notes", "Chatter",
+                    "Emails", "Demos", "Quotes", "Events", "Cases", "History", "Files",
+                    "Assets & Training", "Campaigns", "Visits"])
 
     # Contacts — Salesforce-style cards
     with tabs[0]:
@@ -1168,6 +1171,202 @@ def page_detail():
                 col_main, col_action = st.columns([5, 1])
                 col_main.markdown(f"**{title}.{ext}** · :gray[{size_str} · {parent_label}]")
                 col_action.link_button("Download", f"{RELEASE_BASE}{bucket}/{cv_id}.{ext}", use_container_width=True)
+
+        # Legacy Salesforce Attachments (pre-Files architecture). Binary not in
+        # the backup snapshot, but the metadata documents what existed.
+        att_df = q("""
+        SELECT Name, ContentType, BodyLength, Description, CreatedDate, CreatedById, ParentId
+        FROM attachments
+        WHERE (AccountId = ? OR ParentId = ?
+               OR ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+               OR ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+               OR ParentId IN (SELECT Id FROM tasks WHERE AccountId = ? OR WhatId = ?))
+              AND IsDeleted = 0
+        ORDER BY CreatedDate DESC
+        """, (aid, aid, aid, aid, aid, aid))
+        if not att_df.empty:
+            st.markdown("---")
+            st.markdown(f":gray[**Legacy attachments** &middot; {len(att_df):,} pre-Files attachments (metadata only — binaries not in this snapshot)]")
+            disp = att_df.copy()
+            disp["When"] = disp["CreatedDate"].str.slice(0, 10)
+            disp["Size"] = disp["BodyLength"].fillna(0).apply(
+                lambda b: f"{b/1024:,.0f} KB" if b and b < 1024*1024 else (f"{b/1024/1024:,.1f} MB" if b else "")
+            )
+            disp = disp[["When","Name","ContentType","Size","Description"]]
+            st.dataframe(
+                disp, use_container_width=True, hide_index=True,
+                column_config={
+                    "When":        st.column_config.TextColumn(width="small"),
+                    "Name":        st.column_config.TextColumn(width="large"),
+                    "ContentType": st.column_config.TextColumn("Type", width="small"),
+                    "Size":        st.column_config.TextColumn(width="small"),
+                    "Description": st.column_config.TextColumn(width="medium"),
+                },
+            )
+
+    # Assets & Training
+    with tabs[12]:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown(":gray[**Installed equipment**]")
+            assets_df = q("""
+            SELECT a.Name, a.SerialNumber, a.Status, a.InstallDate, a.PurchaseDate,
+                   a.Description, p.Name AS Product, c.Name AS Contact
+            FROM assets a
+            LEFT JOIN products p ON p.Id = a.Product2Id
+            LEFT JOIN contacts c ON c.Id = a.ContactId
+            WHERE a.AccountId = ? AND a.IsDeleted = 0
+            ORDER BY a.InstallDate DESC NULLS LAST, a.CreatedDate DESC
+            """, (aid,))
+            if assets_df.empty:
+                st.markdown(":gray[—]")
+            else:
+                st.dataframe(
+                    assets_df.rename(columns={"InstallDate":"Installed","PurchaseDate":"Purchased","SerialNumber":"S/N"}),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "Installed":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                        "Purchased":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                        "Name":       st.column_config.TextColumn(width="medium"),
+                        "Product":    st.column_config.TextColumn(width="medium"),
+                        "Status":     st.column_config.TextColumn(width="small"),
+                        "S/N":        st.column_config.TextColumn(width="small"),
+                    },
+                )
+
+            st.markdown(":gray[**Corporate-group membership**]")
+            tvc_df = q("""
+            SELECT t.Name, t.MembershipStatus, t.CreatedDate, p.Name AS ParentAccount
+            FROM tvc_memberships t
+            LEFT JOIN accounts p ON p.Id = t.ParentAccountId
+            WHERE t.AccountId = ?
+            ORDER BY t.CreatedDate DESC
+            """, (aid,))
+            if tvc_df.empty:
+                st.markdown(":gray[—]")
+            else:
+                st.dataframe(
+                    tvc_df.rename(columns={"MembershipStatus":"Status","CreatedDate":"Created","ParentAccount":"Parent"}),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "Created": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                        "Name":    st.column_config.TextColumn(width="large"),
+                        "Status":  st.column_config.TextColumn(width="small"),
+                        "Parent":  st.column_config.TextColumn(width="medium"),
+                    },
+                )
+        with col_b:
+            st.markdown(":gray[**Training records**]")
+            tr_df = q("""
+            SELECT t.TrainingType, t.TrainingDate, t.CompletionDate, t.Status,
+                   t.Sonographer, c.Name AS Contact, o.Name AS Opportunity
+            FROM training_records t
+            LEFT JOIN contacts c ON c.Id = t.ContactId
+            LEFT JOIN opportunities o ON o.Id = t.OpportunityId
+            WHERE t.AccountId = ?
+               OR t.OpportunityId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+               OR t.ContactId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+            ORDER BY t.TrainingDate DESC NULLS LAST, t.CreatedDate DESC
+            """, (aid, aid, aid))
+            if tr_df.empty:
+                st.markdown(":gray[—]")
+            else:
+                st.dataframe(
+                    tr_df.rename(columns={"TrainingType":"Type","TrainingDate":"Scheduled","CompletionDate":"Completed"}),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "Scheduled":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                        "Completed":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                        "Type":        st.column_config.TextColumn(width="medium"),
+                        "Status":      st.column_config.TextColumn(width="small"),
+                        "Sonographer": st.column_config.TextColumn(width="medium"),
+                        "Contact":     st.column_config.TextColumn(width="medium"),
+                        "Opportunity": st.column_config.TextColumn(width="medium"),
+                    },
+                )
+
+    # Campaigns
+    with tabs[13]:
+        camp_df = q("""
+        SELECT c.Name AS Campaign, c.Type, c.Status AS CampaignStatus,
+               c.StartDate, c.EndDate,
+               cm.Status AS MemberStatus, cm.HasResponded, cm.FirstRespondedDate,
+               co.Name AS ContactName, co.Title AS ContactTitle, co.Email AS ContactEmail,
+               l.Company AS LeadCompany, l.FirstName AS LeadFirst, l.LastName AS LeadLast
+        FROM campaign_members cm
+        JOIN campaigns c ON c.Id = cm.CampaignId
+        LEFT JOIN contacts co ON co.Id = cm.ContactId
+        LEFT JOIN leads l ON l.Id = cm.LeadId
+        WHERE cm.ContactId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+           OR cm.LeadId IN (SELECT Id FROM leads WHERE ConvertedAccountId = ?)
+        ORDER BY c.StartDate DESC NULLS LAST, cm.CreatedDate DESC
+        """, (aid, aid))
+        st.caption(f":gray[{len(camp_df):,} campaign memberships]")
+        if camp_df.empty:
+            st.markdown(":gray[No campaign memberships on contacts at this clinic.]")
+        else:
+            disp = camp_df.copy()
+            disp["Who"] = disp.apply(
+                lambda r: r["ContactName"] if r.get("ContactName") else
+                          (f"{_safe(r.get('LeadFirst'),'')} {_safe(r.get('LeadLast'),'')} (lead)".strip()
+                           if r.get("LeadFirst") or r.get("LeadLast") else "—"),
+                axis=1
+            )
+            disp["Responded"] = disp["HasResponded"].map({1:"Yes",0:""}).fillna("")
+            disp = disp[["StartDate","Campaign","Type","Who","ContactTitle","MemberStatus","Responded","FirstRespondedDate"]]
+            st.dataframe(
+                disp.rename(columns={
+                    "StartDate":"Campaign Start","ContactTitle":"Title",
+                    "MemberStatus":"Member status","FirstRespondedDate":"First response",
+                }),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Campaign Start":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                    "Campaign":         st.column_config.TextColumn(width="large"),
+                    "Type":             st.column_config.TextColumn(width="small"),
+                    "Who":              st.column_config.TextColumn(width="medium"),
+                    "Title":            st.column_config.TextColumn(width="medium"),
+                    "Member status":    st.column_config.TextColumn(width="small"),
+                    "Responded":        st.column_config.TextColumn(width="small"),
+                    "First response":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                },
+            )
+
+    # Visits — Maps waypoints (in-person rep visits) plus the parent route
+    with tabs[14]:
+        wp_df = q("""
+        SELECT w.VisitDate, w.ArrivalTime, w.DepartureTime, w.Notes,
+               u.Name AS Rep, r.Name AS Route,
+               r.TravelDistance AS RouteMiles, r.TravelTime AS RouteMinutes
+        FROM waypoints w
+        LEFT JOIN users u ON u.Id = w.OwnerId
+        LEFT JOIN maps_routes r ON r.Id = w.RouteId
+        WHERE w.AccountId = ?
+        ORDER BY w.VisitDate DESC NULLS LAST, w.ArrivalTime DESC
+        """, (aid,))
+        st.caption(f":gray[{len(wp_df):,} rep visits to this clinic (from Maps waypoints)]")
+        if wp_df.empty:
+            st.markdown(":gray[No logged in-person visits.]")
+        else:
+            disp = wp_df.copy()
+            disp["Visit"] = disp["VisitDate"].astype(str).str.slice(0,10)
+            disp["Arrived"] = disp["ArrivalTime"].astype(str).str.slice(11,16)
+            disp["Left"] = disp["DepartureTime"].astype(str).str.slice(11,16)
+            disp = disp[["Visit","Rep","Arrived","Left","Notes","Route","RouteMiles","RouteMinutes"]]
+            st.dataframe(
+                disp.rename(columns={"RouteMiles":"Route miles","RouteMinutes":"Route min"}),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Visit":       st.column_config.TextColumn(width="small"),
+                    "Rep":         st.column_config.TextColumn(width="medium"),
+                    "Arrived":     st.column_config.TextColumn(width="small"),
+                    "Left":        st.column_config.TextColumn(width="small"),
+                    "Notes":       st.column_config.TextColumn(width="large"),
+                    "Route":       st.column_config.TextColumn(width="medium"),
+                    "Route miles": st.column_config.NumberColumn(format="%.1f", width="small"),
+                    "Route min":   st.column_config.NumberColumn(format="%.0f", width="small"),
+                },
+            )
 
 # ───────────────────── PAGE: Sales activity ─────────────────────
 def page_activity():
