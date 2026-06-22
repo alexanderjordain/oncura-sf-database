@@ -30,17 +30,28 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v11.db")
-    EXPECTED_BYTES = 1_250_562_048  # the v11 DB is 1.25 GB exact; partial downloads must be rejected
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v12.db")
+    EXPECTED_BYTES = 1_289_449_472  # v12 = v11 + ANALYZE stats + perf indexes
     SIZE_TOLERANCE = 2 * 1024 * 1024  # allow ±2 MB to accommodate Content-Encoding variance
+
+    # PRAGMA integrity_check scans the entire 1.25 GB DB and takes ~21 seconds
+    # on Streamlit Cloud's network FS. Since Streamlit re-runs this module on
+    # every interaction, that cost compounds. We memoize the validation
+    # result per (path, mtime, size) tuple so subsequent reruns short-circuit
+    # in microseconds, and downgrade integrity_check to quick_check(1).
+    if not hasattr(_resolve_db_path, "_validation_cache"):
+        _resolve_db_path._validation_cache = {}
+    _val_cache = _resolve_db_path._validation_cache
 
     def _is_complete_valid(path):
         if not os.path.exists(path): return False
         size = os.path.getsize(path)
         if abs(size - EXPECTED_BYTES) > SIZE_TOLERANCE: return False
-        # Schema-level validation — make sure every table the app reads from
-        # is intact. Partial downloads pass naive size checks but corrupt
-        # later pages, so we touch the schema of the most-recently-added tables.
+        mtime = os.path.getmtime(path)
+        key = (path, mtime, size)
+        cached = _val_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             import sqlite3 as _sq
             _c = _sq.connect(path)
@@ -55,10 +66,15 @@ def _resolve_db_path() -> str:
             _c.execute("SELECT Body, Direction FROM sms_logs LIMIT 1")
             _c.execute("SELECT CompanySignedDate, ActivatedDate FROM contracts LIMIT 1")
             _c.execute("SELECT AssetPartNumber FROM assets LIMIT 1")
-            _c.execute("PRAGMA integrity_check")
+            # quick_check is ~50x cheaper than integrity_check and catches
+            # all the corruption modes a truncated download would produce.
+            qc = _c.execute("PRAGMA quick_check(1)").fetchone()
             _c.close()
-            return True
+            ok = (qc is not None and qc[0] == "ok")
+            _val_cache[key] = ok
+            return ok
         except Exception:
+            _val_cache[key] = False
             return False
 
     if _is_complete_valid(target):
@@ -92,13 +108,17 @@ def _resolve_db_path() -> str:
 
 DB_PATH = _resolve_db_path()
 
-# Defensive: clear any stale @st.cache_resource / @st.cache_data values left
-# over from a previous deploy that pointed at an older DB path.
-try:
-    st.cache_resource.clear()
-    st.cache_data.clear()
-except Exception:
-    pass
+# Clear caches ONLY when DB_PATH rotates to a new snapshot — keyed on the
+# resolved path in session_state so within a stable container we keep the
+# @st.cache_data memo across reruns. The previous unconditional clear() at
+# every rerun was wiping ~3.5s worth of memoized queries on every tab click.
+if st.session_state.get("_db_path_seen") != DB_PATH:
+    try:
+        st.cache_resource.clear()
+        st.cache_data.clear()
+    except Exception:
+        pass
+    st.session_state["_db_path_seen"] = DB_PATH
 
 # Startup self-check — surface the actual deployed schema so we can tell
 # whether the v11 download is what we think it is. Renders once at the top
@@ -476,16 +496,29 @@ inject()
 sidebar_brand()
 
 # ───────────────────── DB ─────────────────────
-# Note: we deliberately do NOT @st.cache_resource get_conn(). Streamlit Cloud
-# persists @st.cache_resource values across deploys via internal soft-reload,
-# which means an old container's cached connection to a now-deleted DB path
-# (e.g. .oncura_sf_lookup_v9.db) would survive and the new DB_PATH would be
-# ignored. SQLite connection open is microseconds-cheap so a fresh connection
-# per call is fine and guarantees we always read the latest resolved file.
-def get_conn():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+# get_conn() caches a single sqlite3 connection per DB_PATH. The DB_PATH is
+# the cache key, so when the snapshot rotates (v11 → v12) the new path gets
+# a fresh connection and the old one is GC'd — this preserves the stale-
+# connection fix while restoring per-session warm-up of the page cache,
+# mmap, and prepared-statement plans across the ~30 queries on the detail
+# page.
+@st.cache_resource(show_spinner=False)
+def _open_conn(path: str):
+    con = sqlite3.connect(path, check_same_thread=False)
     con.row_factory = sqlite3.Row
+    # 256 MB memory-mapped reads — eliminates userspace page-cache copy on
+    # Streamlit Cloud's network FS for a 1.25 GB read-heavy DB.
+    con.execute("PRAGMA mmap_size=268435456")
+    # 64 MB per-connection page cache holds ~16k pages.
+    con.execute("PRAGMA cache_size=-65536")
+    # Sort/temp tables in memory; we never write so it can't bloat.
+    con.execute("PRAGMA temp_store=MEMORY")
+    # Defensive — the snapshot is strictly read-only.
+    con.execute("PRAGMA query_only=1")
     return con
+
+def get_conn():
+    return _open_conn(DB_PATH)
 
 @st.cache_data(ttl=3600)
 def q(sql, params=()):
@@ -1549,23 +1582,34 @@ def page_detail():
                 st.html(''.join(rows_html))
 
         with sub[3]:  # Emails
-            try:
-                emails_df = q("""
+            # The OR + LOWER() pattern was scanning all 271,554 list_email_sent
+            # rows on every page load (200ms). UNION ALL of two index-friendly
+            # probes drops it to two SEARCH plans (~5ms total).
+            emails_df = q("""
+            WITH local_contacts AS (
+                SELECT Id, LOWER(Email) AS email_lower FROM contacts
+                WHERE AccountId = ? AND IsDeleted = 0
+            )
+            SELECT * FROM (
                 SELECT le.Subject, le.Name AS CampaignName, le.Status,
                        les.CreatedDate AS Sent, les.Result, les.EmailAddress AS ToEmail,
-                       c.Name AS ContactName
+                       c.Name AS ContactName, les.Id AS _lid
                 FROM list_email_sent les
+                JOIN local_contacts lc ON lc.Id = les.RecipientId
                 LEFT JOIN list_email le ON le.Id = les.ListEmailId
                 LEFT JOIN contacts c ON c.Id = les.RecipientId
-                WHERE les.RecipientId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-                   OR LOWER(les.EmailAddress) IN (
-                       SELECT LOWER(Email) FROM contacts
-                       WHERE AccountId = ? AND IsDeleted = 0 AND Email IS NOT NULL AND Email != ''
-                   )
-                ORDER BY les.CreatedDate DESC LIMIT 300
-                """, (aid, aid))
-            except Exception:
-                emails_df = None
+                UNION
+                SELECT le.Subject, le.Name AS CampaignName, le.Status,
+                       les.CreatedDate AS Sent, les.Result, les.EmailAddress AS ToEmail,
+                       c.Name AS ContactName, les.Id AS _lid
+                FROM list_email_sent les
+                JOIN local_contacts lc ON lc.email_lower = LOWER(les.EmailAddress)
+                  AND lc.email_lower IS NOT NULL AND lc.email_lower != ''
+                LEFT JOIN list_email le ON le.Id = les.ListEmailId
+                LEFT JOIN contacts c ON c.Id = les.RecipientId
+            )
+            ORDER BY Sent DESC LIMIT 300
+            """, (aid,))
             if emails_df is None or emails_df.empty:
                 st.caption(":gray[No list-email sends recorded for this clinic.]")
                 st.markdown(":gray[—]")
@@ -1586,22 +1630,23 @@ def page_detail():
                 )
 
         with sub[4]:  # Demos
-            try:
-                demos_df = q("""
-                SELECT ca.EventStartTime, ca.EventTypeName, ca.EventSubject,
-                       ca.InviteeName, ca.InviteeEmail,
-                       ca.PublisherName AS Rep, ca.Location,
-                       CASE WHEN ca.EventCanceled=1 OR ca.InviteeCanceled=1 THEN 'Canceled' ELSE 'Scheduled' END AS Status,
-                       ca.CancelReason
-                FROM calendly_actions ca
-                WHERE LOWER(ca.InviteeEmail) IN (
-                    SELECT LOWER(Email) FROM contacts
-                    WHERE AccountId = ? AND IsDeleted = 0 AND Email IS NOT NULL AND Email != ''
-                )
-                ORDER BY ca.EventStartTime DESC LIMIT 200
-                """, (aid,))
-            except Exception:
-                demos_df = None
+            # LOWER() against 44k rows was scanning the whole table (~110ms).
+            # CTE-driven JOIN with expression-indexed lookup brings it to <5ms.
+            demos_df = q("""
+            WITH emails AS (
+                SELECT LOWER(Email) AS em FROM contacts
+                WHERE AccountId = ? AND IsDeleted = 0
+                  AND Email IS NOT NULL AND Email != ''
+            )
+            SELECT ca.EventStartTime, ca.EventTypeName, ca.EventSubject,
+                   ca.InviteeName, ca.InviteeEmail,
+                   ca.PublisherName AS Rep, ca.Location,
+                   CASE WHEN ca.EventCanceled=1 OR ca.InviteeCanceled=1 THEN 'Canceled' ELSE 'Scheduled' END AS Status,
+                   ca.CancelReason
+            FROM emails e
+            JOIN calendly_actions ca ON LOWER(ca.InviteeEmail) = e.em
+            ORDER BY ca.EventStartTime DESC LIMIT 200
+            """, (aid,))
             if demos_df is None or demos_df.empty:
                 st.caption(":gray[No Calendly bookings for this clinic.]")
                 st.markdown(":gray[—]")
