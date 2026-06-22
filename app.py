@@ -1820,40 +1820,43 @@ def page_detail():
                 st.html(''.join(cards))
 
         with sub[1]:  # Chatter
-            try:
-                chatter = q("""
-                SELECT 'Post' AS Kind, fp.Id, fp.Title AS Subj, fp.Body, fp.CreatedDate,
-                       u.Name AS Author, NULL AS Field, NULL AS OldVal, NULL AS NewVal
-                FROM feed_posts fp LEFT JOIN users u ON u.Id = fp.InsertedById
-                WHERE fp.IsDeleted = 0 AND (
-                    fp.ParentId = ?
-                    OR fp.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-                    OR fp.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-                )
-                UNION ALL
-                SELECT
-                    CASE WHEN nf.Type = 'TrackedChange' THEN 'Tracked change' ELSE 'NewsFeed' END,
-                    nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name,
-                    ftc.FieldName, ftc.OldValue, ftc.NewValue
-                FROM news_feed nf
-                LEFT JOIN users u ON u.Id = nf.InsertedById
-                LEFT JOIN feed_tracked_change ftc ON ftc.FeedItemId = nf.Id
-                WHERE nf.ParentId = ?
+            # NewsFeed.csv has empty Title/Body for every row — the actual post
+            # content lives in feed_posts (FeedItem). NewsFeed rows are only
+            # informative when they carry a tracked-field-change detail in
+            # feed_tracked_change. Limit the NewsFeed branch of the UNION to
+            # those, otherwise we surface 50k+ "(no title)" rows.
+            chatter = q("""
+            SELECT 'Post' AS Kind, fp.Id, fp.Title AS Subj, fp.Body, fp.CreatedDate,
+                   u.Name AS Author, NULL AS Field, NULL AS OldVal, NULL AS NewVal
+            FROM feed_posts fp LEFT JOIN users u ON u.Id = fp.InsertedById
+            WHERE fp.IsDeleted = 0 AND (
+                fp.ParentId = ?
+                OR fp.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                OR fp.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+            )
+            UNION ALL
+            SELECT 'Tracked change',
+                   nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name,
+                   ftc.FieldName, ftc.OldValue, ftc.NewValue
+            FROM news_feed nf
+            LEFT JOIN users u ON u.Id = nf.InsertedById
+            JOIN feed_tracked_change ftc ON ftc.FeedItemId = nf.Id
+            WHERE nf.Type = 'TrackedChange'
+              AND ftc.FieldName IS NOT NULL
+              AND (nf.ParentId = ?
                    OR nf.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-                   OR nf.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-                UNION ALL
-                SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name,
-                       NULL, NULL, NULL
-                FROM feed_comments fc LEFT JOIN users u ON u.Id = fc.InsertedById
-                WHERE fc.IsDeleted = 0 AND (
-                    fc.ParentId = ?
-                    OR fc.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-                    OR fc.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-                )
-                ORDER BY CreatedDate DESC LIMIT 500
-                """, (aid,)*9)
-            except Exception:
-                chatter = None
+                   OR nf.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?))
+            UNION ALL
+            SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name,
+                   NULL, NULL, NULL
+            FROM feed_comments fc LEFT JOIN users u ON u.Id = fc.InsertedById
+            WHERE fc.IsDeleted = 0 AND (
+                fc.ParentId = ?
+                OR fc.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                OR fc.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+            )
+            ORDER BY CreatedDate DESC LIMIT 500
+            """, (aid,)*9)
             if chatter is None or chatter.empty:
                 st.caption(":gray[No Chatter activity in the snapshot.]")
                 st.markdown(":gray[—]")
@@ -1954,21 +1957,33 @@ def page_detail():
                 )
 
         with sub[3]:  # History
-            try:
-                df = q("SELECT CreatedDate, Field, OldValue, NewValue, CreatedById FROM account_history WHERE AccountId=? ORDER BY CreatedDate DESC LIMIT 500", (aid,))
-            except Exception:
-                df = None
+            # account_history table was dropped; entity_history is the unified
+            # field-history store with ParentId pointing at any object. Surface
+            # changes on this account + any of its opps/contacts/cases so reps
+            # can see the full audit trail.
+            df = q("""
+            SELECT eh.CreatedDate, eh.ParentSobjectType AS ObjType,
+                   eh.Field, eh.OldValue, eh.NewValue,
+                   u.Name AS By
+            FROM entity_history eh
+            LEFT JOIN users u ON u.Id = eh.CreatedById
+            WHERE eh.ParentId = ?
+               OR eh.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+               OR eh.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+               OR eh.ParentId IN (SELECT Id FROM cases WHERE AccountId = ?)
+            ORDER BY eh.CreatedDate DESC LIMIT 500
+            """, (aid, aid, aid, aid))
             if df is None or df.empty:
                 st.caption(":gray[No history data in this snapshot.]")
                 st.markdown(":gray[—]")
             else:
-                st.caption(f":gray[{len(df):,} history changes · most recent 500]")
-                df["CreatedDate"] = df["CreatedDate"].str.slice(0, 19)
+                st.caption(f":gray[{len(df):,} field changes · most recent 500]")
+                df["CreatedDate"] = df["CreatedDate"].astype(str).str.slice(0, 19)
                 st.dataframe(
-                    df.rename(columns={"CreatedById": "By"}),
-                    use_container_width=True, hide_index=True,
+                    df, use_container_width=True, hide_index=True,
                     column_config={
                         "CreatedDate": st.column_config.TextColumn("Changed at", width="small"),
+                        "ObjType":     st.column_config.TextColumn("On", width="small"),
                         "Field":       st.column_config.TextColumn(width="small"),
                         "OldValue":    st.column_config.TextColumn("From", width="medium"),
                         "NewValue":    st.column_config.TextColumn("To",   width="medium"),
