@@ -30,8 +30,8 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v10.db")
-    EXPECTED_BYTES = 1_250_562_048  # the v10 DB is 1.25 GB exact; partial downloads must be rejected
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v11.db")
+    EXPECTED_BYTES = 1_250_562_048  # the v11 DB is 1.25 GB exact; partial downloads must be rejected
     SIZE_TOLERANCE = 2 * 1024 * 1024  # allow ±2 MB to accommodate Content-Encoding variance
 
     def _is_complete_valid(path):
@@ -91,6 +91,30 @@ def _resolve_db_path() -> str:
     return target
 
 DB_PATH = _resolve_db_path()
+
+# Startup self-check — surface the actual deployed schema so we can tell
+# whether the v11 download is what we think it is. Renders once at the top
+# of every page if the contacts table is missing the expanded columns.
+def _self_check():
+    try:
+        import sqlite3 as _sq
+        _c = _sq.connect(DB_PATH)
+        cols = [r[1] for r in _c.execute("PRAGMA table_info(contacts)")]
+        size_mb = os.path.getsize(DB_PATH) / 1024 / 1024
+        _c.close()
+        missing = [c for c in ('Department','MobilePhone','DoNotCall','pi_grade','MailingState') if c not in cols]
+        if missing:
+            st.warning(
+                f":material/warning: Stale snapshot detected at `{DB_PATH}` "
+                f"({size_mb:.0f} MB, {len(cols)} contacts cols). Missing: {missing}. "
+                f"Clearing and re-downloading on next reload…"
+            )
+            try: os.remove(DB_PATH)
+            except Exception: pass
+    except Exception as e:
+        st.warning(f":material/warning: DB self-check failed: {e}")
+
+_self_check()
 
 # ───────────────────── styling ─────────────────────
 _CSS = """
