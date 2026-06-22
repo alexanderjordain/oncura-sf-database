@@ -938,12 +938,29 @@ def page_detail():
     with main_tabs[2]:
         sub = st.tabs(["Activities", "Emails", "Demos", "Events", "Visits", "Cases"])
         with sub[0]:  # Activities
+            # Expanded coverage: catch tasks tied to the clinic via any of —
+            #   direct AccountId, WhatId=Account/Opportunity, WhoId=Contact,
+            #   WhoId=Lead that converted into this account,
+            #   or task_relations linking the task to an account/contact/opp here.
             df = q("""
-            SELECT ActivityDate, Subject, Status, Type, Priority, OwnerId, Description, Id
-            FROM tasks WHERE AccountId=? OR WhatId=?
-            ORDER BY ActivityDate DESC NULLS LAST, CreatedDate DESC
-            """, (aid, aid))
-            st.caption(f":gray[{len(df):,} activities]")
+            SELECT t.ActivityDate, t.Subject, t.Status, t.Type, t.Priority,
+                   t.OwnerId, t.Description, t.Id
+            FROM tasks t
+            WHERE t.AccountId = ?
+               OR t.WhatId    = ?
+               OR t.WhatId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+               OR t.WhoId  IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+               OR t.WhoId  IN (SELECT Id FROM leads WHERE ConvertedAccountId = ?)
+               OR t.Id IN (
+                   SELECT tr.TaskId FROM task_relations tr
+                   WHERE tr.RelationId = ?
+                      OR tr.RelationId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                      OR tr.RelationId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+               )
+            ORDER BY t.ActivityDate DESC NULLS LAST, t.CreatedDate DESC
+            """, (aid, aid, aid, aid, aid, aid, aid, aid))
+            n_with_body = df["Description"].apply(lambda d: bool(d and str(d).strip())).sum() if not df.empty else 0
+            st.caption(f":gray[{len(df):,} activities &middot; {n_with_body:,} with rep notes attached]")
             if df.empty:
                 st.markdown(":gray[—]")
             else:
@@ -955,14 +972,25 @@ def page_detail():
                     for u in q(f"SELECT Id, Name FROM users WHERE Id IN ({placeholders})", tuple(owner_ids)).to_dict('records'):
                         owner_lookup[u['Id']] = u['Name']
 
-                # Build a Salesforce-style timeline (chronological, most recent first)
+                # Inline-body filter: lets reps focus on the substantive notes
+                show_only_notes = st.checkbox(
+                    "Show only activities with rep notes",
+                    value=False, key=f"only_notes_{aid}"
+                )
+                view_df = df.copy()
+                if show_only_notes:
+                    view_df = view_df[view_df["Description"].apply(lambda d: bool(d and str(d).strip()))]
+                view_df = view_df.head(200)
+
                 rows = []
-                for _, t in df.head(200).iterrows():
+                for _, t in view_df.iterrows():
                     date = _safe(t.get('ActivityDate'), '—')
                     subj = _safe(t.get('Subject'), '(no subject)')
                     status = _safe(t.get('Status'), '')
                     ttype  = _safe(t.get('Type'), '')
                     owner_name = owner_lookup.get(_safe(t.get('OwnerId'),''), '')
+                    desc = (t.get('Description') or '')
+                    desc = str(desc).strip() if desc else ''
                     css_class = "timeline-card"
                     if (status or "").upper() == "COMPLETED":
                         css_class += " task-completed"
@@ -970,19 +998,34 @@ def page_detail():
                         css_class += " task-open"
                     meta_parts = [p for p in [ttype, status, owner_name] if p]
                     meta = ' &middot; '.join(_html.escape(p) for p in meta_parts) if meta_parts else '&nbsp;'
+                    # Inline body preview for substantive notes — first 600 chars,
+                    # newlines preserved. Full body still accessible via expander below.
+                    body_html = ''
+                    if desc:
+                        preview = desc[:600]
+                        truncated_marker = ' …' if len(desc) > 600 else ''
+                        body_html = (
+                            f'<div style="margin-top:.45rem; font-family:var(--sans); font-size:.9rem;'
+                            f' color:var(--ink); white-space:pre-wrap; line-height:1.45;">'
+                            f'{_html.escape(preview)}{truncated_marker}'
+                            f'</div>'
+                        )
                     rows.append(
                         f'<div class="timeline-row">'
                         f'<div class="timeline-date">{_html.escape(date)}</div>'
                         f'<div class="{css_class}">'
                         f'<div class="timeline-subject">{_html.escape(subj)[:200]}</div>'
                         f'<div class="timeline-meta">{meta}</div>'
+                        f'{body_html}'
                         f'</div></div>'
                     )
                 st.html(''.join(rows))
-                if len(df) > 200:
-                    st.caption(f":gray[Showing 200 most recent of {len(df):,} activities.]")
+                shown = len(view_df)
+                total = len(df) if not show_only_notes else int(n_with_body)
+                if total > shown:
+                    st.caption(f":gray[Showing {shown} most recent of {total:,}{' with notes' if show_only_notes else ''}.]")
 
-                with st.expander(":gray[Open the body of a specific activity]"):
+                with st.expander(":gray[Open the full body of a specific activity]"):
                     picked = st.selectbox(
                         "Activity",
                         ["—"] + [
