@@ -1359,483 +1359,419 @@ def page_detail():
 
     # ─── Touchpoints ───
     with main_tabs[2]:
-        sub = st.tabs(["Activities", "Calls", "SMS", "Emails", "Demos", "Events", "Visits", "Cases"])
-        with sub[0]:  # Activities
-            # Expanded coverage: catch tasks tied to the clinic via any of —
-            #   direct AccountId, WhatId=Account/Opportunity, WhoId=Contact,
-            #   WhoId=Lead that converted into this account,
-            #   or task_relations linking the task to an account/contact/opp here.
-            df = q("""
-            SELECT t.ActivityDate, t.Subject, t.Status, t.Type, t.Priority,
-                   t.OwnerId, t.Description, t.Id
-            FROM tasks t
-            WHERE t.AccountId = ?
-               OR t.WhatId    = ?
-               OR t.WhatId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-               OR t.WhoId  IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-               OR t.WhoId  IN (SELECT Id FROM leads WHERE ConvertedAccountId = ?)
-               OR t.Id IN (
-                   SELECT tr.TaskId FROM task_relations tr
-                   WHERE tr.RelationId = ?
-                      OR tr.RelationId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-                      OR tr.RelationId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-               )
-            ORDER BY t.ActivityDate DESC NULLS LAST, t.CreatedDate DESC
-            """, (aid, aid, aid, aid, aid, aid, aid, aid))
-            n_with_body = df["Description"].apply(lambda d: bool(d and str(d).strip())).sum() if not df.empty else 0
-            st.caption(f":gray[{len(df):,} activities &middot; {n_with_body:,} with rep notes attached]")
-            if df.empty:
-                st.markdown(":gray[—]")
-            else:
-                import html as _html
-                owner_ids = list({_safe(x,'') for x in df["OwnerId"].tolist() if _safe(x,'')})
-                owner_lookup = {}
-                if owner_ids:
-                    placeholders = ','.join(['?']*len(owner_ids))
-                    for u in q(f"SELECT Id, Name FROM users WHERE Id IN ({placeholders})", tuple(owner_ids)).to_dict('records'):
-                        owner_lookup[u['Id']] = u['Name']
+        # Unified chronological timeline of every clinic touchpoint —
+        # tasks, calls, SMS, marketing emails, Calendly demos, calendar
+        # events, in-person rep visits, and support cases — merged in
+        # date order. Type-filter chips let the rep narrow when needed.
 
-                # Inline-body filter: lets reps focus on the substantive notes
-                show_only_notes = st.checkbox(
-                    "Show only activities with rep notes",
-                    value=False, key=f"only_notes_{aid}"
+        import html as _html
+        from datetime import datetime as _dt
+
+        def _date_str(v):
+            if v is None: return ""
+            s = str(v)
+            return s[:10] if len(s) >= 10 else s
+
+        def _datetime_sort(v):
+            if v is None: return "0000-00-00"
+            s = str(v)
+            return s[:19] if len(s) >= 10 else "0000-00-00"
+
+        timeline_items = []  # list of dicts: kind, when, sort_key, title, meta, body, color
+
+        # ─── Tasks (Activities) ───
+        tasks_df = q("""
+        SELECT t.ActivityDate, t.Subject, t.Status, t.Type, t.OwnerId,
+               t.Description, t.Id, u.Name AS OwnerName
+        FROM tasks t LEFT JOIN users u ON u.Id = t.OwnerId
+        WHERE t.AccountId = ?
+           OR t.WhatId    = ?
+           OR t.WhatId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+           OR t.WhoId  IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+           OR t.WhoId  IN (SELECT Id FROM leads WHERE ConvertedAccountId = ?)
+           OR t.Id IN (
+               SELECT tr.TaskId FROM task_relations tr
+               WHERE tr.RelationId = ?
+                  OR tr.RelationId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                  OR tr.RelationId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+           )
+        ORDER BY t.ActivityDate DESC NULLS LAST, t.CreatedDate DESC
+        """, (aid, aid, aid, aid, aid, aid, aid, aid))
+        for _, t in tasks_df.iterrows():
+            d = _date_str(t.get("ActivityDate"))
+            ttype = _safe(t.get("Type"), "")
+            status = _safe(t.get("Status"), "")
+            owner = _safe(t.get("OwnerName"), "")
+            meta_bits = [b for b in [ttype, status, owner] if b]
+            timeline_items.append({
+                "kind": "Activity",
+                "when": d, "sort_key": _datetime_sort(t.get("ActivityDate")),
+                "title": _safe(t.get("Subject"), "(no subject)"),
+                "meta": " · ".join(meta_bits),
+                "body": _safe(t.get("Description"), ""),
+                "color": "#3A6A9A",  # blue
+            })
+
+        # ─── Calls (Dialpad) ───
+        calls_df = q("""
+        SELECT cl.CreatedDate, cl.ActivityDate, cl.AgentName,
+               cl.CallFrom, cl.CallTo, cl.CallType,
+               cl.CallDuration, cl.ConnectedDuration,
+               cl.CallDisposition, cl.CallDispositionNotes,
+               cl.AICallPurpose, cl.AIOutcome, cl.AISummary, cl.AIActionItems,
+               cl.RecordingURL, cl.Comments
+        FROM call_logs cl
+        WHERE cl.ParentObjectId = ?
+           OR cl.ParentObjectId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+           OR cl.ParentObjectId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+           OR cl.RelatedObjectIds LIKE ?
+        """, (aid, aid, aid, f"%{aid}%"))
+        for _, r in calls_df.iterrows():
+            when_raw = r.get("ActivityDate") or r.get("CreatedDate")
+            ctype = (_safe(r.get("CallType"), "") or "").lower()
+            arrow = "→" if ctype == "outbound" else ("←" if ctype == "inbound" else "·")
+            from_ = _safe(r.get("CallFrom"), "")
+            to_   = _safe(r.get("CallTo"), "")
+            dur   = r.get("ConnectedDuration") or r.get("CallDuration")
+            dur_s = f"{int(dur)}s" if dur else ""
+            disp  = _safe(r.get("CallDisposition"), "")
+            purpose = _safe(r.get("AICallPurpose"), "")
+            outcome = _safe(r.get("AIOutcome"), "")
+            summary = _safe(r.get("AISummary"), "")
+            actions = _safe(r.get("AIActionItems"), "")
+            notes   = _safe(r.get("CallDispositionNotes"), "") or _safe(r.get("Comments"), "")
+            rec     = _safe(r.get("RecordingURL"), "")
+            agent_  = _safe(r.get("AgentName"), "")
+
+            meta_bits = [f"{from_} {arrow} {to_}"]
+            if agent_: meta_bits.append(agent_)
+            if dur_s:  meta_bits.append(dur_s)
+            if disp:   meta_bits.append(disp)
+            if outcome:meta_bits.append(outcome)
+
+            body_parts = []
+            if purpose: body_parts.append(f"Purpose: {purpose}")
+            if summary: body_parts.append(f"AI summary: {summary[:500]}")
+            if actions: body_parts.append(f"Action items: {actions[:300]}")
+            if notes:   body_parts.append(f"Rep notes: {notes[:400]}")
+            if rec:     body_parts.append(f'<a href="{_html.escape(rec)}" target="_blank">Recording</a>')
+
+            timeline_items.append({
+                "kind": "Call",
+                "when": _date_str(when_raw),
+                "sort_key": _datetime_sort(when_raw),
+                "title": "Call",
+                "meta": " · ".join(meta_bits),
+                "body": "\n".join(body_parts),
+                "body_html": "<br>".join(body_parts) if rec else None,
+                "color": "#2F567E",  # blue-deep
+            })
+
+        # ─── SMS (Dialpad) ───
+        sms_df = q("""
+        SELECT sl.CreatedDate, sl.ActivityDate, sl.AgentName,
+               sl.CompanyNumber, sl.CustomerNumber, sl.Direction,
+               sl.Body, sl.MessageStatus, sl.Subject
+        FROM sms_logs sl
+        WHERE sl.ParentObjectId = ?
+           OR sl.ParentObjectId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+           OR sl.ParentObjectId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+           OR sl.RelatedObjectIds LIKE ?
+        """, (aid, aid, aid, f"%{aid}%"))
+        for _, r in sms_df.iterrows():
+            when_raw = r.get("ActivityDate") or r.get("CreatedDate")
+            direction = (_safe(r.get("Direction"), "") or "").lower()
+            arrow = "→" if direction == "outbound" else ("←" if direction == "inbound" else "·")
+            company = _safe(r.get("CompanyNumber"), "")
+            customer = _safe(r.get("CustomerNumber"), "")
+            agent_ = _safe(r.get("AgentName"), "")
+            body = _safe(r.get("Body"), "") or _safe(r.get("Subject"), "")
+            meta_bits = [f"{company} {arrow} {customer}"]
+            if agent_: meta_bits.append(agent_)
+            timeline_items.append({
+                "kind": "SMS",
+                "when": _date_str(when_raw),
+                "sort_key": _datetime_sort(when_raw),
+                "title": "SMS",
+                "meta": " · ".join(meta_bits),
+                "body": body[:1500],
+                "color": "#469B68",  # green
+            })
+
+        # ─── Marketing emails ───
+        emails_df = q("""
+        WITH local_contacts AS (
+            SELECT Id, LOWER(Email) AS email_lower FROM contacts
+            WHERE AccountId = ? AND IsDeleted = 0
+        )
+        SELECT * FROM (
+            SELECT le.Subject AS subj, le.Name AS Campaign, le.Status AS le_status,
+                   les.CreatedDate AS Sent, les.Result AS res, les.EmailAddress AS ToEmail,
+                   c.Name AS ContactName, les.Id AS _lid
+            FROM list_email_sent les
+            JOIN local_contacts lc ON lc.Id = les.RecipientId
+            LEFT JOIN list_email le ON le.Id = les.ListEmailId
+            LEFT JOIN contacts c ON c.Id = les.RecipientId
+            UNION
+            SELECT le.Subject AS subj, le.Name AS Campaign, le.Status AS le_status,
+                   les.CreatedDate AS Sent, les.Result AS res, les.EmailAddress AS ToEmail,
+                   c.Name AS ContactName, les.Id AS _lid
+            FROM list_email_sent les
+            JOIN local_contacts lc ON lc.email_lower = LOWER(les.EmailAddress)
+              AND lc.email_lower IS NOT NULL AND lc.email_lower != ''
+            LEFT JOIN list_email le ON le.Id = les.ListEmailId
+            LEFT JOIN contacts c ON c.Id = les.RecipientId
+        )
+        ORDER BY Sent DESC LIMIT 300
+        """, (aid,))
+        for _, r in emails_df.iterrows():
+            when_raw = r.get("Sent")
+            subj  = _safe(r.get("subj"), "")
+            camp  = _safe(r.get("Campaign"), "")
+            to_   = _safe(r.get("ToEmail"), "")
+            contact = _safe(r.get("ContactName"), "")
+            result = _safe(r.get("res"), "")
+            meta_bits = [b for b in [contact or to_, camp, result] if b]
+            timeline_items.append({
+                "kind": "Email",
+                "when": _date_str(when_raw),
+                "sort_key": _datetime_sort(when_raw),
+                "title": f"Email: {subj}" if subj else "Email",
+                "meta": " · ".join(meta_bits),
+                "body": "",
+                "color": "#E3A033",  # amber
+            })
+
+        # ─── Calendly demos ───
+        demos_df = q("""
+        WITH emails AS (
+            SELECT LOWER(Email) AS em FROM contacts
+            WHERE AccountId = ? AND IsDeleted = 0
+              AND Email IS NOT NULL AND Email != ''
+        )
+        SELECT ca.EventStartTime, ca.EventTypeName, ca.EventSubject,
+               ca.InviteeName, ca.InviteeEmail, ca.PublisherName AS Rep, ca.Location,
+               CASE WHEN ca.EventCanceled=1 OR ca.InviteeCanceled=1 THEN 'Canceled' ELSE 'Scheduled' END AS Status,
+               ca.CancelReason
+        FROM emails e
+        JOIN calendly_actions ca ON LOWER(ca.InviteeEmail) = e.em
+        ORDER BY ca.EventStartTime DESC LIMIT 200
+        """, (aid,))
+        for _, r in demos_df.iterrows():
+            when_raw = r.get("EventStartTime")
+            typ = _safe(r.get("EventTypeName"), "")
+            inv = _safe(r.get("InviteeName"), "")
+            inv_email = _safe(r.get("InviteeEmail"), "")
+            rep = _safe(r.get("Rep"), "")
+            loc = _safe(r.get("Location"), "")
+            status = _safe(r.get("Status"), "")
+            reason = _safe(r.get("CancelReason"), "")
+            meta_bits = [b for b in [typ, inv or inv_email, rep, status, loc] if b]
+            body = reason if reason and status == "Canceled" else ""
+            timeline_items.append({
+                "kind": "Demo",
+                "when": _date_str(when_raw),
+                "sort_key": _datetime_sort(when_raw),
+                "title": _safe(r.get("EventSubject"), "Calendly demo") or "Calendly demo",
+                "meta": " · ".join(meta_bits),
+                "body": body,
+                "color": "#7A2A86",  # purple
+            })
+
+        # ─── Calendar events ───
+        events_df = q("""
+        SELECT ActivityDate, Subject, StartDateTime, Description, OwnerId,
+               Location, DurationInMinutes, Type, Sales_Rep,
+               Calendly_IsNoShow, Calendly_IsRescheduled, Demo_Completed_Date
+        FROM events
+        WHERE AccountId=? OR WhatId=?
+        ORDER BY ActivityDate DESC NULLS LAST
+        """, (aid, aid))
+        owner_ids = [r["OwnerId"] for _, r in events_df.iterrows() if r.get("OwnerId")]
+        owner_map = {}
+        if owner_ids:
+            placeholders = ",".join(["?"]*len(set(owner_ids)))
+            for u in q(f"SELECT Id, Name FROM users WHERE Id IN ({placeholders})",
+                       tuple(set(owner_ids))).to_dict('records'):
+                owner_map[u['Id']] = u['Name']
+        for _, r in events_df.iterrows():
+            when_raw = r.get("ActivityDate")
+            etype = _safe(r.get("Type"), "")
+            loc = _safe(r.get("Location"), "")
+            dur = r.get("DurationInMinutes")
+            dur_s = f"{int(dur)}m" if dur else ""
+            rep = _safe(r.get("Sales_Rep"), "") or owner_map.get(_safe(r.get("OwnerId"),""), "")
+            chips = []
+            if r.get("Calendly_IsNoShow"):     chips.append("NO-SHOW")
+            if r.get("Calendly_IsRescheduled"):chips.append("rescheduled")
+            if r.get("Demo_Completed_Date"):   chips.append("demo completed")
+            meta_bits = [b for b in [etype, dur_s, loc, rep] + chips if b]
+            timeline_items.append({
+                "kind": "Event",
+                "when": _date_str(when_raw),
+                "sort_key": _datetime_sort(when_raw),
+                "title": _safe(r.get("Subject"), "(no subject)"),
+                "meta": " · ".join(meta_bits),
+                "body": _safe(r.get("Description"), ""),
+                "color": "#2F567E",
+            })
+
+        # ─── Maps waypoint visits ───
+        visits_df = q("""
+        SELECT w.VisitDate, w.ArrivalTime, w.DepartureTime, w.Notes,
+               u.Name AS Rep, r.Name AS Route,
+               r.TravelDistance AS RouteMiles, r.TravelTime AS RouteMinutes
+        FROM waypoints w
+        LEFT JOIN users u ON u.Id = w.OwnerId
+        LEFT JOIN maps_routes r ON r.Id = w.RouteId
+        WHERE w.AccountId = ?
+        """, (aid,))
+        for _, r in visits_df.iterrows():
+            when_raw = r.get("VisitDate")
+            rep = _safe(r.get("Rep"), "")
+            route = _safe(r.get("Route"), "")
+            arr = str(_safe(r.get("ArrivalTime"), ""))[11:16]
+            dep = str(_safe(r.get("DepartureTime"), ""))[11:16]
+            time_range = f"{arr}–{dep}" if arr and dep else (arr or dep)
+            meta_bits = [b for b in [rep, time_range, route] if b]
+            timeline_items.append({
+                "kind": "Visit",
+                "when": _date_str(when_raw),
+                "sort_key": _datetime_sort(when_raw),
+                "title": "In-person visit",
+                "meta": " · ".join(meta_bits),
+                "body": _safe(r.get("Notes"), ""),
+                "color": "#1B6E3A",  # forest green
+            })
+
+        # ─── Support cases ───
+        cases_df = q("""
+        SELECT c.CaseNumber, c.Subject, c.Status, c.Priority, c.STAT,
+               c.Level_of_Urgency, c.Type_of_Scan, c.Patient_Name, c.Patient_Age,
+               c.Immediate_Area_of_Concern, c.Notes_on_OPD, c.Description,
+               c.Sonographer_Call_Back_Log_Priority,
+               c.X1st_Callback_Time, c.X1st_Callback_Completed_At,
+               c.CreatedDate, c.ClosedDate
+        FROM cases c WHERE c.AccountId=?
+        """, (aid,))
+        for _, r in cases_df.iterrows():
+            when_raw = r.get("CreatedDate")
+            status = _safe(r.get("Status"), "")
+            prio = _safe(r.get("Priority"), "")
+            urg = _safe(r.get("Level_of_Urgency"), "")
+            pat = _safe(r.get("Patient_Name"), "")
+            age = _safe(r.get("Patient_Age"), "")
+            scan = _safe(r.get("Type_of_Scan"), "")
+            aoc = _safe(r.get("Immediate_Area_of_Concern"), "")
+            cb_prio = _safe(r.get("Sonographer_Call_Back_Log_Priority"), "")
+
+            chips = []
+            if r.get("STAT"): chips.append("★ STAT")
+            if urg:           chips.append(urg)
+            if prio:          chips.append(prio)
+            if status:        chips.append(status)
+            if cb_prio:       chips.append(f"CB prio: {cb_prio}")
+            meta_bits = chips + [b for b in [scan, (pat + (f" (age {age})" if age else "") if pat else "")] if b]
+            body = _safe(r.get("Description"), "")
+            if aoc:    body = (f"Area of concern: {aoc}\n\n" + body).strip()
+            if _safe(r.get("Notes_on_OPD"), ""):
+                body = (body + f"\n\nOPD notes: {_safe(r.get('Notes_on_OPD'), '')}").strip()
+            color = "#9C2727" if r.get("STAT") else "#3A6A9A"
+            timeline_items.append({
+                "kind": "Case",
+                "when": _date_str(when_raw),
+                "sort_key": _datetime_sort(when_raw),
+                "title": f"Case #{_safe(r.get('CaseNumber'),'?')}: {_safe(r.get('Subject'),'')}",
+                "meta": " · ".join(meta_bits),
+                "body": body,
+                "color": color,
+            })
+
+        # ─── Render unified timeline ───
+        kind_counts = {}
+        for it in timeline_items:
+            kind_counts[it["kind"]] = kind_counts.get(it["kind"], 0) + 1
+        all_kinds = ["Activity","Call","SMS","Email","Demo","Event","Visit","Case"]
+
+        st.caption(
+            f":gray[{len(timeline_items):,} touchpoints &middot; "
+            + " · ".join(f"{kind_counts.get(k,0)} {k.lower()}{'s' if kind_counts.get(k,0)!=1 else ''}" for k in all_kinds if kind_counts.get(k,0))
+            + "]"
+        )
+
+        # Type filter chips (multi-select)
+        active_kinds = st.multiselect(
+            "Filter touchpoint types",
+            options=all_kinds,
+            default=all_kinds,
+            label_visibility="collapsed",
+            key=f"tp_kinds_{aid}",
+            placeholder="Show all touchpoint types",
+        )
+        col_hide_l, col_hide_r = st.columns([1, 4])
+        hide_empty = col_hide_l.checkbox("Hide empty-body", value=False, key=f"tp_hide_empty_{aid}")
+
+        # Sort descending by date
+        timeline_items.sort(key=lambda x: x.get("sort_key", ""), reverse=True)
+
+        # Filter + cap
+        filtered = [it for it in timeline_items if it["kind"] in active_kinds]
+        if hide_empty:
+            filtered = [it for it in filtered if (it.get("body") or "").strip()]
+        SHOW_LIMIT = 300
+        shown = filtered[:SHOW_LIMIT]
+        if len(filtered) > SHOW_LIMIT:
+            st.caption(f":gray[Showing {SHOW_LIMIT} most recent of {len(filtered):,} (use type filters above to narrow).]")
+
+        if not shown:
+            st.markdown(":gray[—]")
+        else:
+            cards_html = []
+            for it in shown:
+                kind = it["kind"]
+                when = it.get("when") or "—"
+                title = _html.escape(it.get("title") or "")
+                meta = _html.escape(it.get("meta") or "") or "&nbsp;"
+                body = it.get("body_html") or _html.escape(it.get("body") or "")
+                color = it["color"]
+                # Truncate body for the timeline card
+                if body and not it.get("body_html") and len(body) > 600:
+                    body = body[:600] + "…"
+                body_html = (f'<div style="margin-top:.45rem; font-family:var(--sans); font-size:.9rem;'
+                             f' color:var(--ink); white-space:pre-wrap; line-height:1.45;">{body}</div>') if body else ""
+                kind_chip = f'<span style="display:inline-block; padding:.05rem .45rem; border-radius:4px; font-family:var(--mono); font-size:.65rem; letter-spacing:.04em; background:{color}; color:white; margin-right:.4rem;">{kind.upper()}</span>'
+                cards_html.append(
+                    f'<div class="timeline-row">'
+                    f'<div class="timeline-date">{_html.escape(when)}</div>'
+                    f'<div class="timeline-card" style="border-left-color:{color};">'
+                    f'<div class="timeline-subject">{kind_chip}{title}</div>'
+                    f'<div class="timeline-meta">{meta}</div>'
+                    f'{body_html}'
+                    f'</div></div>'
                 )
-                view_df = df.copy()
-                if show_only_notes:
-                    view_df = view_df[view_df["Description"].apply(lambda d: bool(d and str(d).strip()))]
-                view_df = view_df.head(200)
+            st.html(''.join(cards_html))
 
-                rows = []
-                for _, t in view_df.iterrows():
-                    date = _safe(t.get('ActivityDate'), '—')
-                    subj = _safe(t.get('Subject'), '(no subject)')
-                    status = _safe(t.get('Status'), '')
-                    ttype  = _safe(t.get('Type'), '')
-                    owner_name = owner_lookup.get(_safe(t.get('OwnerId'),''), '')
-                    desc = (t.get('Description') or '')
-                    desc = str(desc).strip() if desc else ''
-                    css_class = "timeline-card"
-                    if (status or "").upper() == "COMPLETED":
-                        css_class += " task-completed"
-                    elif status:
-                        css_class += " task-open"
-                    meta_parts = [p for p in [ttype, status, owner_name] if p]
-                    meta = ' &middot; '.join(_html.escape(p) for p in meta_parts) if meta_parts else '&nbsp;'
-                    # Inline body preview for substantive notes — first 600 chars,
-                    # newlines preserved. Full body still accessible via expander below.
-                    body_html = ''
+        # Inline body expander — for tasks/activities where the description is
+        # often longer than the 600-char preview; lets a rep open one specific item.
+        if tasks_df is not None and not tasks_df.empty:
+            with st.expander(":gray[Open the full body of a specific activity]"):
+                picked = st.selectbox(
+                    "Activity",
+                    ["—"] + [
+                        f"{_safe(r['ActivityDate'],'?')}  ·  {_safe(r['Subject'],'(no subject)')[:80]}  [{r['Id']}]"
+                        for _, r in tasks_df.iterrows()
+                    ],
+                    label_visibility="collapsed",
+                    key=f"tp_full_{aid}",
+                )
+                if picked != "—":
+                    tid = picked.split("[")[-1].rstrip("]")
+                    row = tasks_df[tasks_df["Id"] == tid].iloc[0]
+                    st.markdown(f":gray[**Subject**]  {_safe(row['Subject'],'(no subject)')}")
+                    st.markdown(f":gray[**Date**]  {_safe(row['ActivityDate'],'—')}  ·  :gray[**Status**]  {_safe(row['Status'],'—')}")
+                    desc = _safe(row.get('Description'), '')
                     if desc:
-                        preview = desc[:600]
-                        truncated_marker = ' …' if len(desc) > 600 else ''
-                        body_html = (
-                            f'<div style="margin-top:.45rem; font-family:var(--sans); font-size:.9rem;'
-                            f' color:var(--ink); white-space:pre-wrap; line-height:1.45;">'
-                            f'{_html.escape(preview)}{truncated_marker}'
-                            f'</div>'
-                        )
-                    rows.append(
-                        f'<div class="timeline-row">'
-                        f'<div class="timeline-date">{_html.escape(date)}</div>'
-                        f'<div class="{css_class}">'
-                        f'<div class="timeline-subject">{_html.escape(subj)[:200]}</div>'
-                        f'<div class="timeline-meta">{meta}</div>'
-                        f'{body_html}'
-                        f'</div></div>'
-                    )
-                st.html(''.join(rows))
-                shown = len(view_df)
-                total = len(df) if not show_only_notes else int(n_with_body)
-                if total > shown:
-                    st.caption(f":gray[Showing {shown} most recent of {total:,}{' with notes' if show_only_notes else ''}.]")
-
-                with st.expander(":gray[Open the full body of a specific activity]"):
-                    picked = st.selectbox(
-                        "Activity",
-                        ["—"] + [
-                            f"{_safe(r['ActivityDate'],'?')}  ·  {_safe(r['Subject'],'(no subject)')[:80]}  [{r['Id']}]"
-                            for _, r in df.iterrows()
-                        ],
-                        label_visibility="collapsed",
-                    )
-                    if picked != "—":
-                        tid = picked.split("[")[-1].rstrip("]")
-                        row = df[df["Id"] == tid].iloc[0]
-                        st.markdown(f":gray[**Subject**]  {_safe(row['Subject'],'(no subject)')}")
-                        st.markdown(f":gray[**Date**]  {_safe(row['ActivityDate'],'—')}  ·  :gray[**Status**]  {_safe(row['Status'],'—')}")
-                        desc = _safe(row.get('Description'), '')
-                        if desc:
-                            st.text(desc)
-
-        with sub[1]:  # Calls — Dialpad phone calls
-            # call_logs has no AccountId — it's tied via ParentObjectId which
-            # can be an Account, Contact, Lead, or Opportunity.
-            calls_df = q("""
-            SELECT cl.CreatedDate, cl.ActivityDate, cl.AgentName,
-                   cl.CallFrom, cl.CallTo, cl.CallType,
-                   cl.CallDuration, cl.ConnectedDuration,
-                   cl.CallDisposition, cl.CallDispositionPicklist,
-                   cl.CallDispositionNotes,
-                   cl.AICallPurpose, cl.AIOutcome, cl.AICSAT, cl.AIPlaybookAdherence,
-                   cl.AISummary, cl.AIActionItems, cl.Comments,
-                   cl.RecordingURL, cl.CallStartTime, cl.CallEndTime,
-                   cl.ParentObjectId, cl.ObjectName, cl.TargetName,
-                   cl.Subject, cl.Status, cl.Type
-            FROM call_logs cl
-            WHERE cl.ParentObjectId = ?
-               OR cl.ParentObjectId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-               OR cl.ParentObjectId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-               OR cl.RelatedObjectIds LIKE ?
-            ORDER BY cl.ActivityDate DESC NULLS LAST, cl.CreatedDate DESC
-            """, (aid, aid, aid, f'%{aid}%'))
-            st.caption(f":gray[{len(calls_df):,} Dialpad calls]")
-            if calls_df.empty:
-                st.markdown(":gray[No Dialpad call logs tied to this clinic.]")
-            else:
-                import html as _html
-                rows_html = []
-                for _, r in calls_df.iterrows():
-                    when = str(_safe(r.get('ActivityDate'), '') or _safe(r.get('CreatedDate'), ''))[:16].replace('T',' ')
-                    agent = _safe(r.get('AgentName'), '') or _safe(r.get('TargetName'), '')
-                    from_  = _safe(r.get('CallFrom'), '')
-                    to_    = _safe(r.get('CallTo'), '')
-                    ctype  = (_safe(r.get('CallType'), '') or '').lower()
-                    dur    = r.get('ConnectedDuration') or r.get('CallDuration')
-                    dur_s  = f"{int(dur)}s" if dur else ""
-                    disp   = _safe(r.get('CallDisposition'), '') or _safe(r.get('CallDispositionPicklist'), '')
-                    purpose= _safe(r.get('AICallPurpose'), '')
-                    outcome= _safe(r.get('AIOutcome'), '')
-                    summary= _safe(r.get('AISummary'), '')
-                    actions= _safe(r.get('AIActionItems'), '')
-                    notes  = _safe(r.get('CallDispositionNotes'), '') or _safe(r.get('Comments'), '')
-                    rec    = _safe(r.get('RecordingURL'), '')
-
-                    arrow = '→' if ctype == 'outbound' else ('←' if ctype == 'inbound' else '·')
-                    chips = []
-                    if ctype:    chips.append(f'<span class="chip chip-info">{_html.escape(ctype)}</span>')
-                    if dur_s:    chips.append(f'<span class="chip chip-mute">{dur_s}</span>')
-                    if disp:     chips.append(f'<span class="chip chip-info">{_html.escape(disp)}</span>')
-                    if outcome:  chips.append(f'<span class="chip chip-good">{_html.escape(outcome)}</span>')
-                    if rec:      chips.append(f'<a class="chip chip-mute" href="{_html.escape(rec)}" target="_blank">Recording</a>')
-
-                    body_parts = []
-                    if purpose: body_parts.append(f'<b>Purpose:</b> {_html.escape(purpose)}')
-                    if summary: body_parts.append(f'<b>AI summary:</b> {_html.escape(summary)[:600]}')
-                    if actions: body_parts.append(f'<b>Action items:</b> {_html.escape(actions)[:400]}')
-                    if notes:   body_parts.append(f'<b>Rep notes:</b> {_html.escape(notes)[:500]}')
-                    body_html = '<br>'.join(body_parts)
-
-                    rows_html.append(
-                        f'<div style="background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--blue);'
-                        f' border-radius:6px; padding:.55rem .8rem; margin-bottom:.4rem;">'
-                        f'<div style="display:flex; justify-content:space-between; align-items:baseline;">'
-                        f'<div style="font-family:var(--mono); font-size:.85rem; color:var(--ink);">{_html.escape(from_)} <span style="color:var(--muted);">{arrow}</span> {_html.escape(to_)}</div>'
-                        f'<div style="font-family:var(--mono); font-size:.7rem; color:var(--muted);">{_html.escape(when)}{(" &middot; " + _html.escape(agent)) if agent else ""}</div>'
-                        f'</div>'
-                        f'<div style="margin:.3rem 0;">{"".join(chips)}</div>'
-                        f'{("<div style=\"font-size:.88rem;\">" + body_html + "</div>") if body_html else ""}'
-                        f'</div>'
-                    )
-                st.html(''.join(rows_html))
-
-        with sub[2]:  # SMS — Dialpad text messages
-            sms_df = q("""
-            SELECT sl.CreatedDate, sl.ActivityDate, sl.AgentName,
-                   sl.CompanyNumber, sl.CustomerNumber, sl.Direction,
-                   sl.Body, sl.MessageStatus, sl.Subject,
-                   sl.ParentObjectId
-            FROM sms_logs sl
-            WHERE sl.ParentObjectId = ?
-               OR sl.ParentObjectId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-               OR sl.ParentObjectId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-               OR sl.RelatedObjectIds LIKE ?
-            ORDER BY sl.ActivityDate DESC NULLS LAST, sl.CreatedDate DESC
-            """, (aid, aid, aid, f'%{aid}%'))
-            st.caption(f":gray[{len(sms_df):,} text messages]")
-            if sms_df.empty:
-                st.markdown(":gray[No SMS logs tied to this clinic.]")
-            else:
-                import html as _html
-                rows_html = []
-                for _, r in sms_df.iterrows():
-                    when = str(_safe(r.get('ActivityDate'), '') or _safe(r.get('CreatedDate'), ''))[:16].replace('T',' ')
-                    agent = _safe(r.get('AgentName'), '')
-                    company = _safe(r.get('CompanyNumber'), '')
-                    customer= _safe(r.get('CustomerNumber'), '')
-                    direction = (_safe(r.get('Direction'), '') or '').lower()
-                    body = _safe(r.get('Body'), '') or _safe(r.get('Subject'), '')
-                    arrow = '→' if direction == 'outbound' else ('←' if direction == 'inbound' else '·')
-                    status = _safe(r.get('MessageStatus'), '')
-                    chips = []
-                    if direction: chips.append(f'<span class="chip chip-info">{_html.escape(direction)}</span>')
-                    if status:    chips.append(f'<span class="chip chip-mute">{_html.escape(status)}</span>')
-                    rows_html.append(
-                        f'<div style="background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--green);'
-                        f' border-radius:6px; padding:.5rem .8rem; margin-bottom:.4rem;">'
-                        f'<div style="display:flex; justify-content:space-between; align-items:baseline;">'
-                        f'<div style="font-family:var(--mono); font-size:.82rem;">{_html.escape(company)} <span style="color:var(--muted);">{arrow}</span> {_html.escape(customer)}</div>'
-                        f'<div style="font-family:var(--mono); font-size:.7rem; color:var(--muted);">{_html.escape(when)}{(" &middot; " + _html.escape(agent)) if agent else ""}</div>'
-                        f'</div>'
-                        f'<div style="margin:.25rem 0;">{"".join(chips)}</div>'
-                        f'<div style="white-space:pre-wrap; font-size:.9rem; color:var(--ink);">{_html.escape(body)[:1500]}</div>'
-                        f'</div>'
-                    )
-                st.html(''.join(rows_html))
-
-        with sub[3]:  # Emails
-            # The OR + LOWER() pattern was scanning all 271,554 list_email_sent
-            # rows on every page load (200ms). UNION ALL of two index-friendly
-            # probes drops it to two SEARCH plans (~5ms total).
-            emails_df = q("""
-            WITH local_contacts AS (
-                SELECT Id, LOWER(Email) AS email_lower FROM contacts
-                WHERE AccountId = ? AND IsDeleted = 0
-            )
-            SELECT * FROM (
-                SELECT le.Subject, le.Name AS CampaignName, le.Status,
-                       les.CreatedDate AS Sent, les.Result, les.EmailAddress AS ToEmail,
-                       c.Name AS ContactName, les.Id AS _lid
-                FROM list_email_sent les
-                JOIN local_contacts lc ON lc.Id = les.RecipientId
-                LEFT JOIN list_email le ON le.Id = les.ListEmailId
-                LEFT JOIN contacts c ON c.Id = les.RecipientId
-                UNION
-                SELECT le.Subject, le.Name AS CampaignName, le.Status,
-                       les.CreatedDate AS Sent, les.Result, les.EmailAddress AS ToEmail,
-                       c.Name AS ContactName, les.Id AS _lid
-                FROM list_email_sent les
-                JOIN local_contacts lc ON lc.email_lower = LOWER(les.EmailAddress)
-                  AND lc.email_lower IS NOT NULL AND lc.email_lower != ''
-                LEFT JOIN list_email le ON le.Id = les.ListEmailId
-                LEFT JOIN contacts c ON c.Id = les.RecipientId
-            )
-            ORDER BY Sent DESC LIMIT 300
-            """, (aid,))
-            if emails_df is None or emails_df.empty:
-                st.caption(":gray[No list-email sends recorded for this clinic.]")
-                st.markdown(":gray[—]")
-            else:
-                st.caption(f":gray[{len(emails_df):,} marketing emails sent to contacts at this clinic]")
-                disp = emails_df.rename(columns={"CampaignName":"Campaign","ToEmail":"To","ContactName":"Contact"})
-                st.dataframe(
-                    disp[["Sent","Subject","Campaign","To","Contact","Result"]],
-                    use_container_width=True, hide_index=True,
-                    column_config={
-                        "Sent":     st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                        "Subject":  st.column_config.TextColumn(width="large"),
-                        "Campaign": st.column_config.TextColumn(width="medium"),
-                        "To":       st.column_config.TextColumn(width="medium"),
-                        "Contact":  st.column_config.TextColumn(width="medium"),
-                        "Result":   st.column_config.TextColumn(width="small"),
-                    },
-                )
-
-        with sub[4]:  # Demos
-            # LOWER() against 44k rows was scanning the whole table (~110ms).
-            # CTE-driven JOIN with expression-indexed lookup brings it to <5ms.
-            demos_df = q("""
-            WITH emails AS (
-                SELECT LOWER(Email) AS em FROM contacts
-                WHERE AccountId = ? AND IsDeleted = 0
-                  AND Email IS NOT NULL AND Email != ''
-            )
-            SELECT ca.EventStartTime, ca.EventTypeName, ca.EventSubject,
-                   ca.InviteeName, ca.InviteeEmail,
-                   ca.PublisherName AS Rep, ca.Location,
-                   CASE WHEN ca.EventCanceled=1 OR ca.InviteeCanceled=1 THEN 'Canceled' ELSE 'Scheduled' END AS Status,
-                   ca.CancelReason
-            FROM emails e
-            JOIN calendly_actions ca ON LOWER(ca.InviteeEmail) = e.em
-            ORDER BY ca.EventStartTime DESC LIMIT 200
-            """, (aid,))
-            if demos_df is None or demos_df.empty:
-                st.caption(":gray[No Calendly bookings for this clinic.]")
-                st.markdown(":gray[—]")
-            else:
-                st.caption(f":gray[{len(demos_df):,} Calendly bookings]")
-                disp = demos_df.rename(columns={"EventStartTime":"When","EventTypeName":"Type","EventSubject":"Subject","InviteeName":"Invitee","InviteeEmail":"Email"})
-                st.dataframe(
-                    disp[["When","Type","Subject","Invitee","Email","Rep","Status","Location"]],
-                    use_container_width=True, hide_index=True,
-                )
-
-        with sub[5]:  # Events
-            df = q("""
-            SELECT ActivityDate, Subject, StartDateTime, Description, OwnerId
-            FROM events WHERE AccountId=? OR WhatId=?
-            ORDER BY ActivityDate DESC NULLS LAST
-            """, (aid, aid))
-            st.caption(f":gray[{len(df):,} events]")
-            if df.empty: st.markdown(":gray[—]")
-            else:
-                ev_disp = df.rename(columns={"ActivityDate": "Date", "OwnerId": "Owner"})[["Date", "Subject", "StartDateTime", "Owner", "Description"]]
-                st.dataframe(
-                    ev_disp, use_container_width=True, hide_index=True,
-                    column_config={
-                        "Date":          st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                        "Subject":       st.column_config.TextColumn(width="large"),
-                        "StartDateTime": st.column_config.TextColumn("Start", width="small"),
-                        "Owner":         st.column_config.TextColumn(width="small"),
-                        "Description":   st.column_config.TextColumn(width="large"),
-                    },
-                )
-
-        with sub[6]:  # Visits
-            wp_df = q("""
-            SELECT w.Id, w.VisitDate, w.ArrivalTime, w.DepartureTime, w.Notes, w.CreatedDate,
-                   u.Name AS Rep, r.Name AS Route,
-                   r.TravelDistance AS RouteMiles, r.TravelTime AS RouteMinutes
-            FROM waypoints w
-            LEFT JOIN users u ON u.Id = w.OwnerId
-            LEFT JOIN maps_routes r ON r.Id = w.RouteId
-            WHERE w.AccountId = ?
-            ORDER BY w.VisitDate DESC NULLS LAST, w.ArrivalTime DESC, w.CreatedDate DESC
-            """, (aid,))
-            st.caption(f":gray[{len(wp_df):,} rep visits to this clinic (from Maps waypoints)]")
-            if wp_df.empty:
-                st.markdown(":gray[No logged in-person visits.]")
-            else:
-                # Surface rep notes prominently before the visit table — these are
-                # rare (14 across the whole backup) but high-signal: KOL IDs,
-                # follow-up status, conversation summaries.
-                with_notes = wp_df[wp_df["Notes"].notna() & (wp_df["Notes"].astype(str).str.strip() != "")]
-                if not with_notes.empty:
-                    st.markdown(":gray[**Rep visit notes**]")
-                    for _, row in with_notes.iterrows():
-                        when = _safe(row.get("VisitDate"), "") or _safe(row.get("CreatedDate"), "")
-                        when = str(when)[:10] if when else "(no date)"
-                        rep = _safe(row.get("Rep"), "Unknown rep")
-                        route = _safe(row.get("Route"), "")
-                        meta = f"{when} &middot; {rep}"
-                        if route: meta += f" &middot; {route}"
-                        note_text = str(row.get("Notes")).strip()
-                        st.markdown(
-                            f"""<div style="border-left:3px solid var(--green); background:var(--surface);
-                                  padding:.6rem .9rem; margin:.4rem 0; border-radius:4px;">
-                                  <div style="font-family:var(--mono); font-size:.72rem;
-                                    color:var(--muted); letter-spacing:.04em; text-transform:uppercase;
-                                    margin-bottom:.3rem;">{meta}</div>
-                                  <div style="color:var(--ink); font-size:.95rem; line-height:1.45;">{note_text}</div>
-                                </div>""",
-                            unsafe_allow_html=True,
-                        )
-                    st.markdown("---")
-
-                disp = wp_df.copy()
-                disp["Visit"] = disp["VisitDate"].astype(str).str.slice(0,10)
-                disp["Arrived"] = disp["ArrivalTime"].astype(str).str.slice(11,16)
-                disp["Left"] = disp["DepartureTime"].astype(str).str.slice(11,16)
-                disp = disp[["Visit","Rep","Arrived","Left","Notes","Route","RouteMiles","RouteMinutes"]]
-                st.dataframe(
-                    disp.rename(columns={"RouteMiles":"Route miles","RouteMinutes":"Route min"}),
-                    use_container_width=True, hide_index=True,
-                    column_config={
-                        "Visit":       st.column_config.TextColumn(width="small"),
-                        "Rep":         st.column_config.TextColumn(width="medium"),
-                        "Arrived":     st.column_config.TextColumn(width="small"),
-                        "Left":        st.column_config.TextColumn(width="small"),
-                        "Notes":       st.column_config.TextColumn(width="large"),
-                        "Route":       st.column_config.TextColumn(width="medium"),
-                        "Route miles": st.column_config.NumberColumn(format="%.1f", width="small"),
-                        "Route min":   st.column_config.NumberColumn(format="%.0f", width="small"),
-                    },
-                )
-
-        with sub[7]:  # Cases
-            df = q("""
-            SELECT c.Id, c.CaseNumber, c.Subject, c.Status, c.Priority, c.Type,
-                   c.Reason, c.Origin, c.IsEscalated, c.STAT, c.Level_of_Urgency,
-                   c.Service_Type, c.Type_of_Scan, c.Patient_Name, c.Patient_Age,
-                   c.Immediate_Area_of_Concern, c.Notes_on_OPD, c.Description,
-                   c.Sonographer_Call_Back_Log_Priority,
-                   c.Requested_Call_Back_Time, c.X1st_Callback_Time, c.X1st_Callback_Completed_At,
-                   c.CreatedDate, c.ClosedDate, c.Time_Zone,
-                   c.First_Name, c.Last_Name, c.Job_Title, c.Email, c.Primary_Phone,
-                   ct.Name AS ContactName,
-                   asn.Name AS AssetName
-            FROM cases c
-            LEFT JOIN contacts ct ON ct.Id = c.ContactId
-            LEFT JOIN assets   asn ON asn.Id = c.AssetId
-            WHERE c.AccountId=?
-            ORDER BY c.STAT DESC, c.CreatedDate DESC
-            """, (aid,))
-            st.caption(f":gray[{len(df):,} cases]")
-            if df.empty:
-                st.markdown(":gray[—]")
-            else:
-                # Render each case as a card so the clinical detail is readable
-                import html as _html
-                cards_html = []
-                for _, c in df.iterrows():
-                    case_no = _safe(c.get('CaseNumber'), '?')
-                    subj    = _safe(c.get('Subject'), '(no subject)')
-                    status  = _safe(c.get('Status'), '')
-                    prio    = _safe(c.get('Priority'), '')
-                    opened  = str(_safe(c.get('CreatedDate'), ''))[:10]
-                    closed  = str(_safe(c.get('ClosedDate'), ''))[:10]
-                    pat     = _safe(c.get('Patient_Name'), '')
-                    age     = _safe(c.get('Patient_Age'), '')
-                    scan    = _safe(c.get('Type_of_Scan'), '')
-                    urg     = _safe(c.get('Level_of_Urgency'), '')
-                    aoc     = _safe(c.get('Immediate_Area_of_Concern'), '')
-                    cb_prio = _safe(c.get('Sonographer_Call_Back_Log_Priority'), '')
-                    req_cb  = str(_safe(c.get('Requested_Call_Back_Time'), ''))[:16].replace('T',' ')
-                    cb1     = str(_safe(c.get('X1st_Callback_Time'), ''))[:16].replace('T',' ')
-                    cb1_done= str(_safe(c.get('X1st_Callback_Completed_At'), ''))[:16].replace('T',' ')
-                    contact = _safe(c.get('ContactName'), '') or f"{_safe(c.get('First_Name'),'')} {_safe(c.get('Last_Name'),'')}".strip()
-                    phone   = _safe(c.get('Primary_Phone'), '')
-                    email_  = _safe(c.get('Email'), '')
-                    asset_  = _safe(c.get('AssetName'), '')
-                    notes_  = _safe(c.get('Notes_on_OPD'), '')
-                    desc    = _safe(c.get('Description'), '')
-
-                    chips = []
-                    if c.get('STAT'):              chips.append('<span class="chip chip-bad">★ STAT</span>')
-                    if urg and urg.lower() in ('high','urgent','immediate'): chips.append(f'<span class="chip chip-warn">{_html.escape(urg)}</span>')
-                    elif urg:                      chips.append(f'<span class="chip chip-info">{_html.escape(urg)}</span>')
-                    if c.get('IsEscalated'):       chips.append('<span class="chip chip-warn">Escalated</span>')
-                    if prio:                       chips.append(f'<span class="chip chip-info">{_html.escape(prio)}</span>')
-                    if status:
-                        s_css = 'chip-good' if status.lower() == 'closed' else 'chip-info'
-                        chips.append(f'<span class="chip {s_css}">{_html.escape(status)}</span>')
-                    if cb_prio:                    chips.append(f'<span class="chip chip-info">Callback prio: {_html.escape(cb_prio)}</span>')
-
-                    # SLA timer for first callback
-                    sla = ''
-                    if req_cb and not cb1_done:
-                        sla = f'<span class="chip chip-warn">Callback pending (req {_html.escape(req_cb)})</span>'
-                    elif req_cb and cb1_done:
-                        sla = f'<span class="chip chip-good">Callback done {_html.escape(cb1_done)}</span>'
-                    if sla: chips.append(sla)
-
-                    detail_lines = []
-                    if pat or age: detail_lines.append(f'<b>Patient:</b> {_html.escape(pat)} {("(age " + _html.escape(str(age)) + ")") if age else ""}')
-                    if scan:       detail_lines.append(f'<b>Scan:</b> {_html.escape(scan)}')
-                    if aoc:        detail_lines.append(f'<b>Area of concern:</b> {_html.escape(aoc)}')
-                    if asset_:     detail_lines.append(f'<b>Asset:</b> {_html.escape(asset_)}')
-                    if contact:    detail_lines.append(f'<b>Contact:</b> {_html.escape(contact)}' + (f' &middot; {_html.escape(phone)}' if phone else '') + (f' &middot; <a href="mailto:{_html.escape(email_)}">{_html.escape(email_)}</a>' if email_ else ''))
-                    detail_html = '<br>'.join(detail_lines)
-
-                    desc_block = ''
-                    if desc:
-                        desc_block = f'<div style="margin-top:.5rem; white-space:pre-wrap; font-size:.9rem; color:var(--ink);">{_html.escape(desc[:2000])}</div>'
-                    notes_block = ''
-                    if notes_:
-                        notes_block = f'<div style="margin-top:.4rem; padding-top:.4rem; border-top:1px dashed var(--line);"><span style="font-family:var(--mono); font-size:.7rem; color:var(--muted);">OPD NOTES:</span><div style="white-space:pre-wrap; font-size:.9rem;">{_html.escape(notes_[:1500])}</div></div>'
-
-                    cards_html.append(
-                        f'<div style="background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--blue);'
-                        f' border-radius:6px; padding:.7rem .9rem; margin-bottom:.55rem;">'
-                        f'<div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap;">'
-                        f'<div style="font-weight:600; color:var(--blue); font-family:var(--serif); font-size:1.05rem;">{_html.escape(subj)}</div>'
-                        f'<div style="font-family:var(--mono); font-size:.7rem; color:var(--muted);">Case #{_html.escape(case_no)} &middot; opened {_html.escape(opened)}{(" &middot; closed " + _html.escape(closed)) if closed and closed != "None" else ""}</div>'
-                        f'</div>'
-                        f'<div style="margin:.35rem 0;">{"".join(chips)}</div>'
-                        f'{("<div style=\"font-size:.88rem; color:var(--ink); margin-top:.3rem;\">" + detail_html + "</div>") if detail_html else ""}'
-                        f'{desc_block}'
-                        f'{notes_block}'
-                        f'</div>'
-                    )
-                st.html(''.join(cards_html))
+                        st.text(desc)
 
     # ─── Records ───
     with main_tabs[3]:
