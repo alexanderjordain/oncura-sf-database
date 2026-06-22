@@ -672,727 +672,719 @@ def page_detail():
     )
     st.html(highlights_html)
 
-    tabs = st.tabs(["Contacts", "Opportunities", "Activities", "Notes", "Chatter",
-                    "Emails", "Demos", "Quotes", "Events", "Cases", "History", "Files",
-                    "Assets & Training", "Campaigns", "Visits"])
+    main_tabs = st.tabs(["People", "Pipeline", "Touchpoints", "Records"])
 
-    # Contacts — Salesforce-style cards
-    with tabs[0]:
-        df = q("""
-        SELECT Id, Name, FirstName, LastName, Title, Email, Phone
-        FROM contacts WHERE AccountId=? AND IsDeleted=0
-        ORDER BY LastName COLLATE NOCASE, FirstName COLLATE NOCASE
-        """, (aid,))
-        st.caption(f":gray[{len(df):,} contacts]")
-        if df.empty:
-            st.markdown(":gray[—]")
-        else:
-            import html as _html
-            cards = []
-            for _, c in df.iterrows():
-                name = _safe(c.get('Name'), '').strip() or f"{_safe(c.get('FirstName'),'')} {_safe(c.get('LastName'),'')}".strip() or '(no name)'
-                title = _safe(c.get('Title'), '')
-                email = _safe(c.get('Email'), '')
-                phone = _safe(c.get('Phone'), '')
-                initials = ''.join([p[0] for p in name.split() if p][:2]).upper() or '?'
-                meta_parts = []
-                if email:
-                    meta_parts.append(f'<a href="mailto:{_html.escape(email)}">{_html.escape(email)}</a>')
-                if phone:
-                    meta_parts.append(_html.escape(phone))
-                meta = ' &middot; '.join(meta_parts) if meta_parts else '—'
-                cards.append(
-                    f'<div class="contact-card">'
-                    f'<div class="contact-avatar">{_html.escape(initials)}</div>'
-                    f'<div>'
-                    f'<div class="contact-name">{_html.escape(name)}</div>'
-                    f'<div class="contact-title">{_html.escape(title) if title else "&nbsp;"}</div>'
-                    f'<div class="contact-meta">{meta}</div>'
-                    f'</div>'
-                    f'</div>'
-                )
-            st.html(''.join(cards))
-
-    # Opportunities
-    with tabs[1]:
-        df = q("""
-        SELECT Id, Name, Amount, StageName, IsWon, CloseDate, Type, LeadSource, OwnerId
-        FROM opportunities WHERE AccountId=?
-        ORDER BY CloseDate DESC
-        """, (aid,))
-        won = df[df["IsWon"] == 1]["Amount"].sum() if not df.empty else 0
-        st.caption(f":gray[{len(df):,} opportunities &middot; Closed-Won total: **{fmt_money(won)}**]")
-        if df.empty:
-            st.markdown(":gray[—]")
-        else:
-            def _stage_label(row):
-                if row.get("IsWon"): return "Won"
-                stage = (row.get("StageName") or "").lower()
-                if "lost" in stage: return "Lost"
-                return "Open"
-            df_disp = df.copy()
-            df_disp["Status"] = df_disp.apply(_stage_label, axis=1)
-            df_disp = df_disp[["Status", "CloseDate", "Name", "Amount", "StageName", "Type", "LeadSource", "Id"]]
-            df_disp = df_disp.rename(columns={
-                "Name": "Opportunity", "StageName": "Stage", "CloseDate": "Close Date",
-                "LeadSource": "Source", "Id": "SF Opp ID"
-            })
-            st.dataframe(
-                df_disp, use_container_width=True, hide_index=True,
-                height=min(560, 60 + 36*len(df)),
-                column_config={
-                    "Status":      st.column_config.TextColumn(width="small", help="Won · Lost · Open"),
-                    "Close Date":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                    "Opportunity": st.column_config.TextColumn(width="large"),
-                    "Amount":      st.column_config.NumberColumn(format="$%d", width="small"),
-                    "Stage":       st.column_config.TextColumn(width="small"),
-                    "Type":        st.column_config.TextColumn(width="small"),
-                    "Source":      st.column_config.TextColumn(width="small"),
-                    "SF Opp ID":   st.column_config.TextColumn(width="small"),
-                },
-            )
-
-            with st.expander(":gray[Inspect stage history & description for one opportunity]"):
-                opp_choice = st.selectbox(
-                    "Opportunity",
-                    ["—"] + [
-                        f"{_safe(r['Name'],'(no name)')}  ({fmt_money(r['Amount'])}, {fmt_date(r['CloseDate'])})  [{r['Id']}]"
-                        for _, r in df.iterrows()
-                    ],
-                    label_visibility="collapsed",
-                )
-                if opp_choice != "—":
-                    opp_id = opp_choice.split("[")[-1].rstrip("]")
-                    hist = q("SELECT CreatedDate, StageName, Amount, CloseDate FROM opp_history WHERE OpportunityId=? ORDER BY CreatedDate", (opp_id,))
-                    if hist.empty:
-                        st.caption(":gray[No stage history rows.]")
-                    else:
-                        hist["CreatedDate"] = hist["CreatedDate"].str.slice(0, 19)
-                        st.dataframe(
-                            hist, use_container_width=True, hide_index=True,
-                            column_config={
-                                "CreatedDate": st.column_config.TextColumn("Changed at", width="small"),
-                                "StageName":   st.column_config.TextColumn("Stage", width="medium"),
-                                "Amount":      st.column_config.NumberColumn(format="$%d", width="small"),
-                                "CloseDate":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                            },
-                        )
-                    opp_full = one("SELECT Description, NextStep FROM opportunities WHERE Id=?", (opp_id,))
-                    if opp_full and opp_full.get("Description"):
-                        st.markdown(":gray[**Description**]")
-                        st.write(opp_full["Description"])
-                    if opp_full and opp_full.get("NextStep"):
-                        st.markdown(f":gray[**Next step**]  {opp_full['NextStep']}")
-
-    # Tasks
-    with tabs[2]:
-        df = q("""
-        SELECT ActivityDate, Subject, Status, Type, Priority, OwnerId, Description, Id
-        FROM tasks WHERE AccountId=? OR WhatId=?
-        ORDER BY ActivityDate DESC NULLS LAST, CreatedDate DESC
-        """, (aid, aid))
-        st.caption(f":gray[{len(df):,} activities]")
-        if df.empty:
-            st.markdown(":gray[—]")
-        else:
-            import html as _html
-            owner_ids = list({_safe(x,'') for x in df["OwnerId"].tolist() if _safe(x,'')})
-            owner_lookup = {}
-            if owner_ids:
-                placeholders = ','.join(['?']*len(owner_ids))
-                for u in q(f"SELECT Id, Name FROM users WHERE Id IN ({placeholders})", tuple(owner_ids)).to_dict('records'):
-                    owner_lookup[u['Id']] = u['Name']
-
-            # Build a Salesforce-style timeline (chronological, most recent first)
-            rows = []
-            for _, t in df.head(200).iterrows():
-                date = _safe(t.get('ActivityDate'), '—')
-                subj = _safe(t.get('Subject'), '(no subject)')
-                status = _safe(t.get('Status'), '')
-                ttype  = _safe(t.get('Type'), '')
-                owner_name = owner_lookup.get(_safe(t.get('OwnerId'),''), '')
-                css_class = "timeline-card"
-                if (status or "").upper() == "COMPLETED":
-                    css_class += " task-completed"
-                elif status:
-                    css_class += " task-open"
-                meta_parts = [p for p in [ttype, status, owner_name] if p]
-                meta = ' &middot; '.join(_html.escape(p) for p in meta_parts) if meta_parts else '&nbsp;'
-                rows.append(
-                    f'<div class="timeline-row">'
-                    f'<div class="timeline-date">{_html.escape(date)}</div>'
-                    f'<div class="{css_class}">'
-                    f'<div class="timeline-subject">{_html.escape(subj)[:200]}</div>'
-                    f'<div class="timeline-meta">{meta}</div>'
-                    f'</div></div>'
-                )
-            st.html(''.join(rows))
-            if len(df) > 200:
-                st.caption(f":gray[Showing 200 most recent of {len(df):,} activities.]")
-
-            with st.expander(":gray[Open the body of a specific activity]"):
-                picked = st.selectbox(
-                    "Activity",
-                    ["—"] + [
-                        f"{_safe(r['ActivityDate'],'?')}  ·  {_safe(r['Subject'],'(no subject)')[:80]}  [{r['Id']}]"
-                        for _, r in df.iterrows()
-                    ],
-                    label_visibility="collapsed",
-                )
-                if picked != "—":
-                    tid = picked.split("[")[-1].rstrip("]")
-                    row = df[df["Id"] == tid].iloc[0]
-                    st.markdown(f":gray[**Subject**]  {_safe(row['Subject'],'(no subject)')}")
-                    st.markdown(f":gray[**Date**]  {_safe(row['ActivityDate'],'—')}  ·  :gray[**Status**]  {_safe(row['Status'],'—')}")
-                    desc = _safe(row.get('Description'), '')
-                    if desc:
-                        st.text(desc)
-
-    # Notes (legacy SF Note object — prospecting notes by Jaclyn, Sarah, etc.)
-    with tabs[3]:
-        # Gather notes whose ParentId is the account, any contact of the account,
-        # or any opportunity of the account. Use OwnerId for author (CreatedById
-        # in this org is a legacy migration user on most rows).
-        notes_df = q("""
-        SELECT n.Id, n.Title, n.Body, n.CreatedDate, n.OwnerId,
-               u.Name AS AuthorName, n.ParentId
-        FROM notes n
-        LEFT JOIN users u ON u.Id = n.OwnerId
-        WHERE n.IsDeleted = 0 AND (
-            n.ParentId = ?
-            OR n.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-            OR n.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-        )
-        ORDER BY n.CreatedDate DESC
-        """, (aid, aid, aid))
-
-        author_counts = q("""
-        SELECT COALESCE(u.Name, '(unknown)') AS AuthorName, COUNT(*) AS n
-        FROM notes n
-        LEFT JOIN users u ON u.Id = n.OwnerId
-        WHERE n.IsDeleted = 0 AND (
-            n.ParentId = ?
-            OR n.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-            OR n.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-        )
-        GROUP BY AuthorName
-        ORDER BY n DESC
-        """, (aid, aid, aid))
-
-        st.caption(f":gray[{len(notes_df):,} notes (by Jaclyn, Sarah, and other reps over the clinic's lifetime)]")
-        if notes_df.empty:
-            st.markdown(":gray[No notes on this clinic.]")
-        else:
-            authors = ["All authors"] + [f"{r['AuthorName']} ({r['n']})" for _, r in author_counts.iterrows() if r['AuthorName']]
-            choice = st.selectbox("Filter by author", authors, key=f"note_author_{aid}", label_visibility="collapsed")
-            if choice != "All authors":
-                target = choice.rsplit(" (", 1)[0]
-                notes_df = notes_df[notes_df["AuthorName"] == target]
-
-            import html as _html
-            cards = []
-            for _, n in notes_df.iterrows():
-                title = _safe(n.get("Title"), "")
-                body  = _safe(n.get("Body"), "")
-                author = _safe(n.get("AuthorName"), "Unknown")
-                created = _safe(n.get("CreatedDate"), "")[:10]
-                # Note bodies can be plain or rich text — strip basic HTML for display
-                body_plain = (body or "").replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-                # Render as a card
-                cards.append(
-                    f'<div class="timeline-row">'
-                    f'<div class="timeline-date">{_html.escape(created) or "—"}</div>'
-                    f'<div class="timeline-card">'
-                    f'<div class="timeline-subject">{_html.escape(title) if title else "(untitled note)"}</div>'
-                    f'<div class="timeline-meta">by {_html.escape(author)}</div>'
-                    f'<div style="margin-top:.5rem; font-family:var(--sans); font-size:.92rem; color:var(--ink); white-space:pre-wrap;">{_html.escape(body_plain)[:2000]}</div>'
-                    f'</div></div>'
-                )
-            st.html(''.join(cards))
-
-    # Chatter — FeedPost + NewsFeed + FeedComment timeline. For TrackedChange
-    # entries (auto-generated when a field changed), join FeedTrackedChange so we
-    # can show "Field X: 'Y' -> 'Z'" instead of empty body.
-    with tabs[4]:
-        try:
-            chatter = q("""
-            SELECT 'Post' AS Kind, fp.Id, fp.Title AS Subj, fp.Body, fp.CreatedDate,
-                   u.Name AS Author, NULL AS Field, NULL AS OldVal, NULL AS NewVal
-            FROM feed_posts fp LEFT JOIN users u ON u.Id = fp.InsertedById
-            WHERE fp.IsDeleted = 0 AND (
-                fp.ParentId = ?
-                OR fp.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-                OR fp.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-            )
-            UNION ALL
-            SELECT
-                CASE WHEN nf.Type = 'TrackedChange' THEN 'Tracked change' ELSE 'NewsFeed' END,
-                nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name,
-                ftc.FieldName, ftc.OldValue, ftc.NewValue
-            FROM news_feed nf
-            LEFT JOIN users u ON u.Id = nf.InsertedById
-            LEFT JOIN feed_tracked_change ftc ON ftc.FeedItemId = nf.Id
-            WHERE nf.ParentId = ?
-               OR nf.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-               OR nf.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-            UNION ALL
-            SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name,
-                   NULL, NULL, NULL
-            FROM feed_comments fc LEFT JOIN users u ON u.Id = fc.InsertedById
-            WHERE fc.IsDeleted = 0 AND (
-                fc.ParentId = ?
-                OR fc.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-                OR fc.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-            )
-            ORDER BY CreatedDate DESC LIMIT 500
-            """, (aid,)*9)
-        except Exception:
-            chatter = None
-        if chatter is None or chatter.empty:
-            st.caption(":gray[No Chatter activity in the snapshot.]")
-            st.markdown(":gray[—]")
-        else:
-            st.caption(f":gray[{len(chatter):,} Chatter entries (posts, news feed, comments)]")
-            import html as _html
-            rows_html = []
-            for _, c in chatter.iterrows():
-                kind = _safe(c.get("Kind"), "")
-                subj = _safe(c.get("Subj"), "")
-                body = _safe(c.get("Body"), "")
-                author = _safe(c.get("Author"), "Unknown")
-                created = _safe(c.get("CreatedDate"), "")[:10]
-                field = _safe(c.get("Field"), "")
-                old_v = _safe(c.get("OldVal"), "")
-                new_v = _safe(c.get("NewVal"), "")
-                # For TrackedChange rows, the human-readable detail is in field/old/new
-                if kind == "Tracked change" and field:
-                    subj_html = f"{_html.escape(field)}: {_html.escape(old_v) or '—'} &rarr; {_html.escape(new_v) or '—'}"
-                else:
-                    subj_html = _html.escape(subj or "(no title)")[:200]
-                body_plain = (body or "").replace("<br>", "\n").replace("<br/>", "\n")
-                rows_html.append(
-                    f'<div class="timeline-row">'
-                    f'<div class="timeline-date">{_html.escape(created) or "—"}</div>'
-                    f'<div class="timeline-card">'
-                    f'<div class="timeline-subject">{subj_html}</div>'
-                    f'<div class="timeline-meta">{_html.escape(kind)} &middot; {_html.escape(author)}</div>'
-                    f'<div style="margin-top:.4rem; font-family:var(--sans); font-size:.9rem; color:var(--ink); white-space:pre-wrap;">{_html.escape(body_plain)[:1500]}</div>'
-                    f'</div></div>'
-                )
-            st.html(''.join(rows_html))
-
-    # Emails — list email sends per clinic. Match by RecipientId = contact.Id
-    # OR by EmailAddress = contact.Email (case-insensitive) so we catch lead-only
-    # recipients with no contact ID.
-    with tabs[5]:
-        try:
-            emails_df = q("""
-            SELECT le.Subject, le.Name AS CampaignName, le.Status,
-                   les.CreatedDate AS Sent, les.Result, les.EmailAddress AS ToEmail,
-                   c.Name AS ContactName
-            FROM list_email_sent les
-            LEFT JOIN list_email le ON le.Id = les.ListEmailId
-            LEFT JOIN contacts c ON c.Id = les.RecipientId
-            WHERE les.RecipientId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-               OR LOWER(les.EmailAddress) IN (
-                   SELECT LOWER(Email) FROM contacts
-                   WHERE AccountId = ? AND IsDeleted = 0 AND Email IS NOT NULL AND Email != ''
-               )
-            ORDER BY les.CreatedDate DESC LIMIT 300
-            """, (aid, aid))
-        except Exception:
-            emails_df = None
-        if emails_df is None or emails_df.empty:
-            st.caption(":gray[No list-email sends recorded for this clinic.]")
-            st.markdown(":gray[—]")
-        else:
-            st.caption(f":gray[{len(emails_df):,} marketing emails sent to contacts at this clinic]")
-            disp = emails_df.rename(columns={"CampaignName":"Campaign","ToEmail":"To","ContactName":"Contact"})
-            st.dataframe(
-                disp[["Sent","Subject","Campaign","To","Contact","Result"]],
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "Sent":     st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                    "Subject":  st.column_config.TextColumn(width="large"),
-                    "Campaign": st.column_config.TextColumn(width="medium"),
-                    "To":       st.column_config.TextColumn(width="medium"),
-                    "Contact":  st.column_config.TextColumn(width="medium"),
-                    "Result":   st.column_config.TextColumn(width="small"),
-                },
-            )
-
-    # Demos — Calendly bookings. Match by invitee email (the only link to a clinic).
-    with tabs[6]:
-        try:
-            demos_df = q("""
-            SELECT ca.EventStartTime, ca.EventTypeName, ca.EventSubject,
-                   ca.InviteeName, ca.InviteeEmail,
-                   ca.PublisherName AS Rep, ca.Location,
-                   CASE WHEN ca.EventCanceled=1 OR ca.InviteeCanceled=1 THEN 'Canceled' ELSE 'Scheduled' END AS Status,
-                   ca.CancelReason
-            FROM calendly_actions ca
-            WHERE LOWER(ca.InviteeEmail) IN (
-                SELECT LOWER(Email) FROM contacts
-                WHERE AccountId = ? AND IsDeleted = 0 AND Email IS NOT NULL AND Email != ''
-            )
-            ORDER BY ca.EventStartTime DESC LIMIT 200
+    # ─── People ───
+    with main_tabs[0]:
+        sub = st.tabs(["Contacts", "Campaigns"])
+        with sub[0]:  # Contacts
+            df = q("""
+            SELECT Id, Name, FirstName, LastName, Title, Email, Phone
+            FROM contacts WHERE AccountId=? AND IsDeleted=0
+            ORDER BY LastName COLLATE NOCASE, FirstName COLLATE NOCASE
             """, (aid,))
-        except Exception:
-            demos_df = None
-        if demos_df is None or demos_df.empty:
-            st.caption(":gray[No Calendly bookings for this clinic.]")
-            st.markdown(":gray[—]")
-        else:
-            st.caption(f":gray[{len(demos_df):,} Calendly bookings]")
-            disp = demos_df.rename(columns={"EventStartTime":"When","EventTypeName":"Type","EventSubject":"Subject","InviteeName":"Invitee","InviteeEmail":"Email"})
-            st.dataframe(
-                disp[["When","Type","Subject","Invitee","Email","Rep","Status","Location"]],
-                use_container_width=True, hide_index=True,
-            )
-
-    # Quotes
-    with tabs[7]:
-        try:
-            quotes_df = q("""
-            SELECT q.Name, q.QuoteNumber, q.Status, q.TotalPrice, q.ExpirationDate,
-                   q.CreatedDate, u.Name AS CreatedBy
-            FROM quotes q LEFT JOIN users u ON u.Id = q.CreatedById
-            WHERE q.AccountId = ? OR q.OpportunityId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-            ORDER BY q.CreatedDate DESC
-            """, (aid, aid))
-        except Exception:
-            quotes_df = None
-        if quotes_df is None or quotes_df.empty:
-            st.caption(":gray[No SF Quotes on this clinic.]")
-            st.markdown(":gray[—]")
-        else:
-            st.caption(f":gray[{len(quotes_df):,} quotes]")
-            disp = quotes_df.rename(columns={"QuoteNumber":"Quote #","TotalPrice":"Total","ExpirationDate":"Expires","CreatedDate":"Created","CreatedBy":"By"})
-            st.dataframe(
-                disp, use_container_width=True, hide_index=True,
-                column_config={"Total": st.column_config.NumberColumn(format="$%d", width="small")},
-            )
-
-    # Events
-    with tabs[8]:
-        df = q("""
-        SELECT ActivityDate, Subject, StartDateTime, Description, OwnerId
-        FROM events WHERE AccountId=? OR WhatId=?
-        ORDER BY ActivityDate DESC NULLS LAST
-        """, (aid, aid))
-        st.caption(f":gray[{len(df):,} events]")
-        if df.empty: st.markdown(":gray[—]")
-        else:
-            ev_disp = df.rename(columns={"ActivityDate": "Date", "OwnerId": "Owner"})[["Date", "Subject", "StartDateTime", "Owner", "Description"]]
-            st.dataframe(
-                ev_disp, use_container_width=True, hide_index=True,
-                column_config={
-                    "Date":          st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                    "Subject":       st.column_config.TextColumn(width="large"),
-                    "StartDateTime": st.column_config.TextColumn("Start", width="small"),
-                    "Owner":         st.column_config.TextColumn(width="small"),
-                    "Description":   st.column_config.TextColumn(width="large"),
-                },
-            )
-
-    # Cases
-    with tabs[9]:
-        df = q("SELECT CaseNumber, Subject, Status, Priority, CreatedDate, ClosedDate FROM cases WHERE AccountId=? ORDER BY CreatedDate DESC", (aid,))
-        st.caption(f":gray[{len(df):,} cases]")
-        if df.empty: st.markdown(":gray[—]")
-        else:
-            st.dataframe(
-                df, use_container_width=True, hide_index=True,
-                column_config={
-                    "CaseNumber":  st.column_config.TextColumn("Case #", width="small"),
-                    "Subject":     st.column_config.TextColumn(width="large"),
-                    "Status":      st.column_config.TextColumn(width="small"),
-                    "Priority":    st.column_config.TextColumn(width="small"),
-                    "CreatedDate": st.column_config.DateColumn("Opened", format="YYYY-MM-DD", width="small"),
-                    "ClosedDate":  st.column_config.DateColumn("Closed", format="YYYY-MM-DD", width="small"),
-                },
-            )
-
-    # History
-    with tabs[10]:
-        try:
-            df = q("SELECT CreatedDate, Field, OldValue, NewValue, CreatedById FROM account_history WHERE AccountId=? ORDER BY CreatedDate DESC LIMIT 500", (aid,))
-        except Exception:
-            df = None
-        if df is None or df.empty:
-            st.caption(":gray[No history data in this snapshot.]")
-            st.markdown(":gray[—]")
-        else:
-            st.caption(f":gray[{len(df):,} history changes · most recent 500]")
-            df["CreatedDate"] = df["CreatedDate"].str.slice(0, 19)
-            st.dataframe(
-                df.rename(columns={"CreatedById": "By"}),
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "CreatedDate": st.column_config.TextColumn("Changed at", width="small"),
-                    "Field":       st.column_config.TextColumn(width="small"),
-                    "OldValue":    st.column_config.TextColumn("From", width="medium"),
-                    "NewValue":    st.column_config.TextColumn("To",   width="medium"),
-                    "By":          st.column_config.TextColumn(width="small"),
-                },
-            )
-
-    # Files
-    with tabs[11]:
-        # Files tied to this clinic via ContentDocumentLink:
-        # - Direct on Account
-        # - Files on any Opportunity of this account
-        # - Files on any Contact of this account
-        # - Files on any Task tied to this account
-        files_df = q("""
-        SELECT fb.content_version_id, fb.parent_id, fb.parent_type,
-               fb.title, fb.extension, fb.size_bytes, fb.is_inline, fb.release_bucket
-        FROM file_blobs fb
-        WHERE fb.parent_id = ?
-           OR fb.parent_id IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-           OR fb.parent_id IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-           OR fb.parent_id IN (SELECT Id FROM tasks WHERE AccountId = ? OR WhatId = ?)
-        ORDER BY fb.is_inline DESC, fb.title COLLATE NOCASE
-        """, (aid, aid, aid, aid, aid))
-        st.caption(f":gray[{len(files_df):,} files in the Salesforce backup]")
-        RELEASE_BASE = "https://github.com/alexanderjordain/oncura-sf-database/releases/download/files-2026-03-25-"
-        if files_df.empty:
-            st.markdown(":gray[No files on this clinic in the backup.]")
-        else:
-            for _, f in files_df.iterrows():
-                title = _safe(f.get("title"), "(untitled)")
-                ext = _safe(f.get("extension"), "bin") or "bin"
-                cv_id = f.get("content_version_id")
-                bucket = f.get("release_bucket") or "a"
-                size_kb = (f.get("size_bytes") or 0) / 1024
-                size_str = f"{size_kb:,.0f} KB" if size_kb < 1024 else f"{size_kb/1024:,.1f} MB"
-                parent_type = f.get("parent_type") or ""
-                parent_label = {"001": "Account", "003": "Contact", "006": "Opportunity", "00T": "Task", "002": "Note"}.get(parent_type, parent_type)
-                col_main, col_action = st.columns([5, 1])
-                col_main.markdown(f"**{title}.{ext}** · :gray[{size_str} · {parent_label}]")
-                col_action.link_button("Download", f"{RELEASE_BASE}{bucket}/{cv_id}.{ext}", use_container_width=True)
-
-        # Legacy Salesforce Attachments (pre-Files architecture). Binary not in
-        # the backup snapshot, but the metadata documents what existed.
-        att_df = q("""
-        SELECT Name, ContentType, BodyLength, Description, CreatedDate, CreatedById, ParentId
-        FROM attachments
-        WHERE (AccountId = ? OR ParentId = ?
-               OR ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-               OR ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-               OR ParentId IN (SELECT Id FROM tasks WHERE AccountId = ? OR WhatId = ?))
-              AND IsDeleted = 0
-        ORDER BY CreatedDate DESC
-        """, (aid, aid, aid, aid, aid, aid))
-        if not att_df.empty:
-            st.markdown("---")
-            st.markdown(f":gray[**Legacy attachments** &middot; {len(att_df):,} pre-Files attachments (metadata only — binaries not in this snapshot)]")
-            disp = att_df.copy()
-            disp["When"] = disp["CreatedDate"].str.slice(0, 10)
-            disp["Size"] = disp["BodyLength"].fillna(0).apply(
-                lambda b: f"{b/1024:,.0f} KB" if b and b < 1024*1024 else (f"{b/1024/1024:,.1f} MB" if b else "")
-            )
-            disp = disp[["When","Name","ContentType","Size","Description"]]
-            st.dataframe(
-                disp, use_container_width=True, hide_index=True,
-                column_config={
-                    "When":        st.column_config.TextColumn(width="small"),
-                    "Name":        st.column_config.TextColumn(width="large"),
-                    "ContentType": st.column_config.TextColumn("Type", width="small"),
-                    "Size":        st.column_config.TextColumn(width="small"),
-                    "Description": st.column_config.TextColumn(width="medium"),
-                },
-            )
-
-    # Assets & Training
-    with tabs[12]:
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown(":gray[**Installed equipment**]")
-            assets_df = q("""
-            SELECT a.Name, a.SerialNumber, a.Status, a.InstallDate, a.PurchaseDate,
-                   a.Description, p.Name AS Product, c.Name AS Contact
-            FROM assets a
-            LEFT JOIN products p ON p.Id = a.Product2Id
-            LEFT JOIN contacts c ON c.Id = a.ContactId
-            WHERE a.AccountId = ? AND a.IsDeleted = 0
-            ORDER BY a.InstallDate DESC NULLS LAST, a.CreatedDate DESC
-            """, (aid,))
-            if assets_df.empty:
+            st.caption(f":gray[{len(df):,} contacts]")
+            if df.empty:
                 st.markdown(":gray[—]")
             else:
-                st.dataframe(
-                    assets_df.rename(columns={"InstallDate":"Installed","PurchaseDate":"Purchased","SerialNumber":"S/N"}),
-                    use_container_width=True, hide_index=True,
-                    column_config={
-                        "Installed":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                        "Purchased":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                        "Name":       st.column_config.TextColumn(width="medium"),
-                        "Product":    st.column_config.TextColumn(width="medium"),
-                        "Status":     st.column_config.TextColumn(width="small"),
-                        "S/N":        st.column_config.TextColumn(width="small"),
-                    },
-                )
-
-            st.markdown(":gray[**Corporate-group membership**]")
-            tvc_df = q("""
-            SELECT t.Name, t.MembershipStatus, t.CreatedDate, p.Name AS ParentAccount
-            FROM tvc_memberships t
-            LEFT JOIN accounts p ON p.Id = t.ParentAccountId
-            WHERE t.AccountId = ?
-            ORDER BY t.CreatedDate DESC
-            """, (aid,))
-            if tvc_df.empty:
-                st.markdown(":gray[—]")
-            else:
-                st.dataframe(
-                    tvc_df.rename(columns={"MembershipStatus":"Status","CreatedDate":"Created","ParentAccount":"Parent"}),
-                    use_container_width=True, hide_index=True,
-                    column_config={
-                        "Created": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                        "Name":    st.column_config.TextColumn(width="large"),
-                        "Status":  st.column_config.TextColumn(width="small"),
-                        "Parent":  st.column_config.TextColumn(width="medium"),
-                    },
-                )
-        with col_b:
-            st.markdown(":gray[**Training records**]")
-            tr_df = q("""
-            SELECT t.TrainingType, t.TrainingDate, t.CompletionDate, t.Status,
-                   t.Sonographer, c.Name AS Contact, o.Name AS Opportunity
-            FROM training_records t
-            LEFT JOIN contacts c ON c.Id = t.ContactId
-            LEFT JOIN opportunities o ON o.Id = t.OpportunityId
-            WHERE t.AccountId = ?
-               OR t.OpportunityId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-               OR t.ContactId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-            ORDER BY t.TrainingDate DESC NULLS LAST, t.CreatedDate DESC
-            """, (aid, aid, aid))
-            if tr_df.empty:
-                st.markdown(":gray[—]")
-            else:
-                st.dataframe(
-                    tr_df.rename(columns={"TrainingType":"Type","TrainingDate":"Scheduled","CompletionDate":"Completed"}),
-                    use_container_width=True, hide_index=True,
-                    column_config={
-                        "Scheduled":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                        "Completed":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                        "Type":        st.column_config.TextColumn(width="medium"),
-                        "Status":      st.column_config.TextColumn(width="small"),
-                        "Sonographer": st.column_config.TextColumn(width="medium"),
-                        "Contact":     st.column_config.TextColumn(width="medium"),
-                        "Opportunity": st.column_config.TextColumn(width="medium"),
-                    },
-                )
-
-    # Campaigns
-    with tabs[13]:
-        camp_df = q("""
-        SELECT c.Name AS Campaign, c.Type, c.Status AS CampaignStatus,
-               c.StartDate, c.EndDate,
-               cm.Status AS MemberStatus, cm.HasResponded, cm.FirstRespondedDate,
-               co.Name AS ContactName, co.Title AS ContactTitle, co.Email AS ContactEmail,
-               l.Company AS LeadCompany, l.FirstName AS LeadFirst, l.LastName AS LeadLast
-        FROM campaign_members cm
-        JOIN campaigns c ON c.Id = cm.CampaignId
-        LEFT JOIN contacts co ON co.Id = cm.ContactId
-        LEFT JOIN leads l ON l.Id = cm.LeadId
-        WHERE cm.ContactId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-           OR cm.LeadId IN (SELECT Id FROM leads WHERE ConvertedAccountId = ?)
-        ORDER BY c.StartDate DESC NULLS LAST, cm.CreatedDate DESC
-        """, (aid, aid))
-        st.caption(f":gray[{len(camp_df):,} campaign memberships]")
-        if camp_df.empty:
-            st.markdown(":gray[No campaign memberships on contacts at this clinic.]")
-        else:
-            disp = camp_df.copy()
-            disp["Who"] = disp.apply(
-                lambda r: r["ContactName"] if r.get("ContactName") else
-                          (f"{_safe(r.get('LeadFirst'),'')} {_safe(r.get('LeadLast'),'')} (lead)".strip()
-                           if r.get("LeadFirst") or r.get("LeadLast") else "—"),
-                axis=1
-            )
-            disp["Responded"] = disp["HasResponded"].map({1:"Yes",0:""}).fillna("")
-            disp = disp[["StartDate","Campaign","Type","Who","ContactTitle","MemberStatus","Responded","FirstRespondedDate"]]
-            st.dataframe(
-                disp.rename(columns={
-                    "StartDate":"Campaign Start","ContactTitle":"Title",
-                    "MemberStatus":"Member status","FirstRespondedDate":"First response",
-                }),
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "Campaign Start":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                    "Campaign":         st.column_config.TextColumn(width="large"),
-                    "Type":             st.column_config.TextColumn(width="small"),
-                    "Who":              st.column_config.TextColumn(width="medium"),
-                    "Title":            st.column_config.TextColumn(width="medium"),
-                    "Member status":    st.column_config.TextColumn(width="small"),
-                    "Responded":        st.column_config.TextColumn(width="small"),
-                    "First response":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                },
-            )
-
-    # Visits — Maps waypoints (in-person rep visits) plus the parent route
-    with tabs[14]:
-        wp_df = q("""
-        SELECT w.Id, w.VisitDate, w.ArrivalTime, w.DepartureTime, w.Notes, w.CreatedDate,
-               u.Name AS Rep, r.Name AS Route,
-               r.TravelDistance AS RouteMiles, r.TravelTime AS RouteMinutes
-        FROM waypoints w
-        LEFT JOIN users u ON u.Id = w.OwnerId
-        LEFT JOIN maps_routes r ON r.Id = w.RouteId
-        WHERE w.AccountId = ?
-        ORDER BY w.VisitDate DESC NULLS LAST, w.ArrivalTime DESC, w.CreatedDate DESC
-        """, (aid,))
-        st.caption(f":gray[{len(wp_df):,} rep visits to this clinic (from Maps waypoints)]")
-        if wp_df.empty:
-            st.markdown(":gray[No logged in-person visits.]")
-        else:
-            # Surface rep notes prominently before the visit table — these are
-            # rare (14 across the whole backup) but high-signal: KOL IDs,
-            # follow-up status, conversation summaries.
-            with_notes = wp_df[wp_df["Notes"].notna() & (wp_df["Notes"].astype(str).str.strip() != "")]
-            if not with_notes.empty:
-                st.markdown(":gray[**Rep visit notes**]")
-                for _, row in with_notes.iterrows():
-                    when = _safe(row.get("VisitDate"), "") or _safe(row.get("CreatedDate"), "")
-                    when = str(when)[:10] if when else "(no date)"
-                    rep = _safe(row.get("Rep"), "Unknown rep")
-                    route = _safe(row.get("Route"), "")
-                    meta = f"{when} &middot; {rep}"
-                    if route: meta += f" &middot; {route}"
-                    note_text = str(row.get("Notes")).strip()
-                    st.markdown(
-                        f"""<div style="border-left:3px solid var(--green); background:var(--surface);
-                              padding:.6rem .9rem; margin:.4rem 0; border-radius:4px;">
-                              <div style="font-family:var(--mono); font-size:.72rem;
-                                color:var(--muted); letter-spacing:.04em; text-transform:uppercase;
-                                margin-bottom:.3rem;">{meta}</div>
-                              <div style="color:var(--ink); font-size:.95rem; line-height:1.45;">{note_text}</div>
-                            </div>""",
-                        unsafe_allow_html=True,
+                import html as _html
+                cards = []
+                for _, c in df.iterrows():
+                    name = _safe(c.get('Name'), '').strip() or f"{_safe(c.get('FirstName'),'')} {_safe(c.get('LastName'),'')}".strip() or '(no name)'
+                    title = _safe(c.get('Title'), '')
+                    email = _safe(c.get('Email'), '')
+                    phone = _safe(c.get('Phone'), '')
+                    initials = ''.join([p[0] for p in name.split() if p][:2]).upper() or '?'
+                    meta_parts = []
+                    if email:
+                        meta_parts.append(f'<a href="mailto:{_html.escape(email)}">{_html.escape(email)}</a>')
+                    if phone:
+                        meta_parts.append(_html.escape(phone))
+                    meta = ' &middot; '.join(meta_parts) if meta_parts else '—'
+                    cards.append(
+                        f'<div class="contact-card">'
+                        f'<div class="contact-avatar">{_html.escape(initials)}</div>'
+                        f'<div>'
+                        f'<div class="contact-name">{_html.escape(name)}</div>'
+                        f'<div class="contact-title">{_html.escape(title) if title else "&nbsp;"}</div>'
+                        f'<div class="contact-meta">{meta}</div>'
+                        f'</div>'
+                        f'</div>'
                     )
-                st.markdown("---")
+                st.html(''.join(cards))
 
-            disp = wp_df.copy()
-            disp["Visit"] = disp["VisitDate"].astype(str).str.slice(0,10)
-            disp["Arrived"] = disp["ArrivalTime"].astype(str).str.slice(11,16)
-            disp["Left"] = disp["DepartureTime"].astype(str).str.slice(11,16)
-            disp = disp[["Visit","Rep","Arrived","Left","Notes","Route","RouteMiles","RouteMinutes"]]
-            st.dataframe(
-                disp.rename(columns={"RouteMiles":"Route miles","RouteMinutes":"Route min"}),
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "Visit":       st.column_config.TextColumn(width="small"),
-                    "Rep":         st.column_config.TextColumn(width="medium"),
-                    "Arrived":     st.column_config.TextColumn(width="small"),
-                    "Left":        st.column_config.TextColumn(width="small"),
-                    "Notes":       st.column_config.TextColumn(width="large"),
-                    "Route":       st.column_config.TextColumn(width="medium"),
-                    "Route miles": st.column_config.NumberColumn(format="%.1f", width="small"),
-                    "Route min":   st.column_config.NumberColumn(format="%.0f", width="small"),
-                },
+        with sub[1]:  # Campaigns
+            camp_df = q("""
+            SELECT c.Name AS Campaign, c.Type, c.Status AS CampaignStatus,
+                   c.StartDate, c.EndDate,
+                   cm.Status AS MemberStatus, cm.HasResponded, cm.FirstRespondedDate,
+                   co.Name AS ContactName, co.Title AS ContactTitle, co.Email AS ContactEmail,
+                   l.Company AS LeadCompany, l.FirstName AS LeadFirst, l.LastName AS LeadLast
+            FROM campaign_members cm
+            JOIN campaigns c ON c.Id = cm.CampaignId
+            LEFT JOIN contacts co ON co.Id = cm.ContactId
+            LEFT JOIN leads l ON l.Id = cm.LeadId
+            WHERE cm.ContactId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+               OR cm.LeadId IN (SELECT Id FROM leads WHERE ConvertedAccountId = ?)
+            ORDER BY c.StartDate DESC NULLS LAST, cm.CreatedDate DESC
+            """, (aid, aid))
+            st.caption(f":gray[{len(camp_df):,} campaign memberships]")
+            if camp_df.empty:
+                st.markdown(":gray[No campaign memberships on contacts at this clinic.]")
+            else:
+                disp = camp_df.copy()
+                disp["Who"] = disp.apply(
+                    lambda r: r["ContactName"] if r.get("ContactName") else
+                              (f"{_safe(r.get('LeadFirst'),'')} {_safe(r.get('LeadLast'),'')} (lead)".strip()
+                               if r.get("LeadFirst") or r.get("LeadLast") else "—"),
+                    axis=1
+                )
+                disp["Responded"] = disp["HasResponded"].map({1:"Yes",0:""}).fillna("")
+                disp = disp[["StartDate","Campaign","Type","Who","ContactTitle","MemberStatus","Responded","FirstRespondedDate"]]
+                st.dataframe(
+                    disp.rename(columns={
+                        "StartDate":"Campaign Start","ContactTitle":"Title",
+                        "MemberStatus":"Member status","FirstRespondedDate":"First response",
+                    }),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "Campaign Start":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                        "Campaign":         st.column_config.TextColumn(width="large"),
+                        "Type":             st.column_config.TextColumn(width="small"),
+                        "Who":              st.column_config.TextColumn(width="medium"),
+                        "Title":            st.column_config.TextColumn(width="medium"),
+                        "Member status":    st.column_config.TextColumn(width="small"),
+                        "Responded":        st.column_config.TextColumn(width="small"),
+                        "First response":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                    },
+                )
+
+    # ─── Pipeline ───
+    with main_tabs[1]:
+        sub = st.tabs(["Opportunities", "Quotes", "Assets & Training"])
+        with sub[0]:  # Opportunities
+            df = q("""
+            SELECT Id, Name, Amount, StageName, IsWon, CloseDate, Type, LeadSource, OwnerId
+            FROM opportunities WHERE AccountId=?
+            ORDER BY CloseDate DESC
+            """, (aid,))
+            won = df[df["IsWon"] == 1]["Amount"].sum() if not df.empty else 0
+            st.caption(f":gray[{len(df):,} opportunities &middot; Closed-Won total: **{fmt_money(won)}**]")
+            if df.empty:
+                st.markdown(":gray[—]")
+            else:
+                def _stage_label(row):
+                    if row.get("IsWon"): return "Won"
+                    stage = (row.get("StageName") or "").lower()
+                    if "lost" in stage: return "Lost"
+                    return "Open"
+                df_disp = df.copy()
+                df_disp["Status"] = df_disp.apply(_stage_label, axis=1)
+                df_disp = df_disp[["Status", "CloseDate", "Name", "Amount", "StageName", "Type", "LeadSource", "Id"]]
+                df_disp = df_disp.rename(columns={
+                    "Name": "Opportunity", "StageName": "Stage", "CloseDate": "Close Date",
+                    "LeadSource": "Source", "Id": "SF Opp ID"
+                })
+                st.dataframe(
+                    df_disp, use_container_width=True, hide_index=True,
+                    height=min(560, 60 + 36*len(df)),
+                    column_config={
+                        "Status":      st.column_config.TextColumn(width="small", help="Won · Lost · Open"),
+                        "Close Date":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                        "Opportunity": st.column_config.TextColumn(width="large"),
+                        "Amount":      st.column_config.NumberColumn(format="$%d", width="small"),
+                        "Stage":       st.column_config.TextColumn(width="small"),
+                        "Type":        st.column_config.TextColumn(width="small"),
+                        "Source":      st.column_config.TextColumn(width="small"),
+                        "SF Opp ID":   st.column_config.TextColumn(width="small"),
+                    },
+                )
+
+                with st.expander(":gray[Inspect stage history & description for one opportunity]"):
+                    opp_choice = st.selectbox(
+                        "Opportunity",
+                        ["—"] + [
+                            f"{_safe(r['Name'],'(no name)')}  ({fmt_money(r['Amount'])}, {fmt_date(r['CloseDate'])})  [{r['Id']}]"
+                            for _, r in df.iterrows()
+                        ],
+                        label_visibility="collapsed",
+                    )
+                    if opp_choice != "—":
+                        opp_id = opp_choice.split("[")[-1].rstrip("]")
+                        hist = q("SELECT CreatedDate, StageName, Amount, CloseDate FROM opp_history WHERE OpportunityId=? ORDER BY CreatedDate", (opp_id,))
+                        if hist.empty:
+                            st.caption(":gray[No stage history rows.]")
+                        else:
+                            hist["CreatedDate"] = hist["CreatedDate"].str.slice(0, 19)
+                            st.dataframe(
+                                hist, use_container_width=True, hide_index=True,
+                                column_config={
+                                    "CreatedDate": st.column_config.TextColumn("Changed at", width="small"),
+                                    "StageName":   st.column_config.TextColumn("Stage", width="medium"),
+                                    "Amount":      st.column_config.NumberColumn(format="$%d", width="small"),
+                                    "CloseDate":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                                },
+                            )
+                        opp_full = one("SELECT Description, NextStep FROM opportunities WHERE Id=?", (opp_id,))
+                        if opp_full and opp_full.get("Description"):
+                            st.markdown(":gray[**Description**]")
+                            st.write(opp_full["Description"])
+                        if opp_full and opp_full.get("NextStep"):
+                            st.markdown(f":gray[**Next step**]  {opp_full['NextStep']}")
+
+        with sub[1]:  # Quotes
+            try:
+                quotes_df = q("""
+                SELECT q.Name, q.QuoteNumber, q.Status, q.TotalPrice, q.ExpirationDate,
+                       q.CreatedDate, u.Name AS CreatedBy
+                FROM quotes q LEFT JOIN users u ON u.Id = q.CreatedById
+                WHERE q.AccountId = ? OR q.OpportunityId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+                ORDER BY q.CreatedDate DESC
+                """, (aid, aid))
+            except Exception:
+                quotes_df = None
+            if quotes_df is None or quotes_df.empty:
+                st.caption(":gray[No SF Quotes on this clinic.]")
+                st.markdown(":gray[—]")
+            else:
+                st.caption(f":gray[{len(quotes_df):,} quotes]")
+                disp = quotes_df.rename(columns={"QuoteNumber":"Quote #","TotalPrice":"Total","ExpirationDate":"Expires","CreatedDate":"Created","CreatedBy":"By"})
+                st.dataframe(
+                    disp, use_container_width=True, hide_index=True,
+                    column_config={"Total": st.column_config.NumberColumn(format="$%d", width="small")},
+                )
+
+        with sub[2]:  # Assets & Training
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown(":gray[**Installed equipment**]")
+                assets_df = q("""
+                SELECT a.Name, a.SerialNumber, a.Status, a.InstallDate, a.PurchaseDate,
+                       a.Description, p.Name AS Product, c.Name AS Contact
+                FROM assets a
+                LEFT JOIN products p ON p.Id = a.Product2Id
+                LEFT JOIN contacts c ON c.Id = a.ContactId
+                WHERE a.AccountId = ? AND a.IsDeleted = 0
+                ORDER BY a.InstallDate DESC NULLS LAST, a.CreatedDate DESC
+                """, (aid,))
+                if assets_df.empty:
+                    st.markdown(":gray[—]")
+                else:
+                    st.dataframe(
+                        assets_df.rename(columns={"InstallDate":"Installed","PurchaseDate":"Purchased","SerialNumber":"S/N"}),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "Installed":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                            "Purchased":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                            "Name":       st.column_config.TextColumn(width="medium"),
+                            "Product":    st.column_config.TextColumn(width="medium"),
+                            "Status":     st.column_config.TextColumn(width="small"),
+                            "S/N":        st.column_config.TextColumn(width="small"),
+                        },
+                    )
+
+                st.markdown(":gray[**Corporate-group membership**]")
+                tvc_df = q("""
+                SELECT t.Name, t.MembershipStatus, t.CreatedDate, p.Name AS ParentAccount
+                FROM tvc_memberships t
+                LEFT JOIN accounts p ON p.Id = t.ParentAccountId
+                WHERE t.AccountId = ?
+                ORDER BY t.CreatedDate DESC
+                """, (aid,))
+                if tvc_df.empty:
+                    st.markdown(":gray[—]")
+                else:
+                    st.dataframe(
+                        tvc_df.rename(columns={"MembershipStatus":"Status","CreatedDate":"Created","ParentAccount":"Parent"}),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "Created": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                            "Name":    st.column_config.TextColumn(width="large"),
+                            "Status":  st.column_config.TextColumn(width="small"),
+                            "Parent":  st.column_config.TextColumn(width="medium"),
+                        },
+                    )
+            with col_b:
+                st.markdown(":gray[**Training records**]")
+                tr_df = q("""
+                SELECT t.TrainingType, t.TrainingDate, t.CompletionDate, t.Status,
+                       t.Sonographer, c.Name AS Contact, o.Name AS Opportunity
+                FROM training_records t
+                LEFT JOIN contacts c ON c.Id = t.ContactId
+                LEFT JOIN opportunities o ON o.Id = t.OpportunityId
+                WHERE t.AccountId = ?
+                   OR t.OpportunityId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+                   OR t.ContactId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                ORDER BY t.TrainingDate DESC NULLS LAST, t.CreatedDate DESC
+                """, (aid, aid, aid))
+                if tr_df.empty:
+                    st.markdown(":gray[—]")
+                else:
+                    st.dataframe(
+                        tr_df.rename(columns={"TrainingType":"Type","TrainingDate":"Scheduled","CompletionDate":"Completed"}),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "Scheduled":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                            "Completed":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                            "Type":        st.column_config.TextColumn(width="medium"),
+                            "Status":      st.column_config.TextColumn(width="small"),
+                            "Sonographer": st.column_config.TextColumn(width="medium"),
+                            "Contact":     st.column_config.TextColumn(width="medium"),
+                            "Opportunity": st.column_config.TextColumn(width="medium"),
+                        },
+                    )
+
+    # ─── Touchpoints ───
+    with main_tabs[2]:
+        sub = st.tabs(["Activities", "Emails", "Demos", "Events", "Visits", "Cases"])
+        with sub[0]:  # Activities
+            df = q("""
+            SELECT ActivityDate, Subject, Status, Type, Priority, OwnerId, Description, Id
+            FROM tasks WHERE AccountId=? OR WhatId=?
+            ORDER BY ActivityDate DESC NULLS LAST, CreatedDate DESC
+            """, (aid, aid))
+            st.caption(f":gray[{len(df):,} activities]")
+            if df.empty:
+                st.markdown(":gray[—]")
+            else:
+                import html as _html
+                owner_ids = list({_safe(x,'') for x in df["OwnerId"].tolist() if _safe(x,'')})
+                owner_lookup = {}
+                if owner_ids:
+                    placeholders = ','.join(['?']*len(owner_ids))
+                    for u in q(f"SELECT Id, Name FROM users WHERE Id IN ({placeholders})", tuple(owner_ids)).to_dict('records'):
+                        owner_lookup[u['Id']] = u['Name']
+
+                # Build a Salesforce-style timeline (chronological, most recent first)
+                rows = []
+                for _, t in df.head(200).iterrows():
+                    date = _safe(t.get('ActivityDate'), '—')
+                    subj = _safe(t.get('Subject'), '(no subject)')
+                    status = _safe(t.get('Status'), '')
+                    ttype  = _safe(t.get('Type'), '')
+                    owner_name = owner_lookup.get(_safe(t.get('OwnerId'),''), '')
+                    css_class = "timeline-card"
+                    if (status or "").upper() == "COMPLETED":
+                        css_class += " task-completed"
+                    elif status:
+                        css_class += " task-open"
+                    meta_parts = [p for p in [ttype, status, owner_name] if p]
+                    meta = ' &middot; '.join(_html.escape(p) for p in meta_parts) if meta_parts else '&nbsp;'
+                    rows.append(
+                        f'<div class="timeline-row">'
+                        f'<div class="timeline-date">{_html.escape(date)}</div>'
+                        f'<div class="{css_class}">'
+                        f'<div class="timeline-subject">{_html.escape(subj)[:200]}</div>'
+                        f'<div class="timeline-meta">{meta}</div>'
+                        f'</div></div>'
+                    )
+                st.html(''.join(rows))
+                if len(df) > 200:
+                    st.caption(f":gray[Showing 200 most recent of {len(df):,} activities.]")
+
+                with st.expander(":gray[Open the body of a specific activity]"):
+                    picked = st.selectbox(
+                        "Activity",
+                        ["—"] + [
+                            f"{_safe(r['ActivityDate'],'?')}  ·  {_safe(r['Subject'],'(no subject)')[:80]}  [{r['Id']}]"
+                            for _, r in df.iterrows()
+                        ],
+                        label_visibility="collapsed",
+                    )
+                    if picked != "—":
+                        tid = picked.split("[")[-1].rstrip("]")
+                        row = df[df["Id"] == tid].iloc[0]
+                        st.markdown(f":gray[**Subject**]  {_safe(row['Subject'],'(no subject)')}")
+                        st.markdown(f":gray[**Date**]  {_safe(row['ActivityDate'],'—')}  ·  :gray[**Status**]  {_safe(row['Status'],'—')}")
+                        desc = _safe(row.get('Description'), '')
+                        if desc:
+                            st.text(desc)
+
+        with sub[1]:  # Emails
+            try:
+                emails_df = q("""
+                SELECT le.Subject, le.Name AS CampaignName, le.Status,
+                       les.CreatedDate AS Sent, les.Result, les.EmailAddress AS ToEmail,
+                       c.Name AS ContactName
+                FROM list_email_sent les
+                LEFT JOIN list_email le ON le.Id = les.ListEmailId
+                LEFT JOIN contacts c ON c.Id = les.RecipientId
+                WHERE les.RecipientId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                   OR LOWER(les.EmailAddress) IN (
+                       SELECT LOWER(Email) FROM contacts
+                       WHERE AccountId = ? AND IsDeleted = 0 AND Email IS NOT NULL AND Email != ''
+                   )
+                ORDER BY les.CreatedDate DESC LIMIT 300
+                """, (aid, aid))
+            except Exception:
+                emails_df = None
+            if emails_df is None or emails_df.empty:
+                st.caption(":gray[No list-email sends recorded for this clinic.]")
+                st.markdown(":gray[—]")
+            else:
+                st.caption(f":gray[{len(emails_df):,} marketing emails sent to contacts at this clinic]")
+                disp = emails_df.rename(columns={"CampaignName":"Campaign","ToEmail":"To","ContactName":"Contact"})
+                st.dataframe(
+                    disp[["Sent","Subject","Campaign","To","Contact","Result"]],
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "Sent":     st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                        "Subject":  st.column_config.TextColumn(width="large"),
+                        "Campaign": st.column_config.TextColumn(width="medium"),
+                        "To":       st.column_config.TextColumn(width="medium"),
+                        "Contact":  st.column_config.TextColumn(width="medium"),
+                        "Result":   st.column_config.TextColumn(width="small"),
+                    },
+                )
+
+        with sub[2]:  # Demos
+            try:
+                demos_df = q("""
+                SELECT ca.EventStartTime, ca.EventTypeName, ca.EventSubject,
+                       ca.InviteeName, ca.InviteeEmail,
+                       ca.PublisherName AS Rep, ca.Location,
+                       CASE WHEN ca.EventCanceled=1 OR ca.InviteeCanceled=1 THEN 'Canceled' ELSE 'Scheduled' END AS Status,
+                       ca.CancelReason
+                FROM calendly_actions ca
+                WHERE LOWER(ca.InviteeEmail) IN (
+                    SELECT LOWER(Email) FROM contacts
+                    WHERE AccountId = ? AND IsDeleted = 0 AND Email IS NOT NULL AND Email != ''
+                )
+                ORDER BY ca.EventStartTime DESC LIMIT 200
+                """, (aid,))
+            except Exception:
+                demos_df = None
+            if demos_df is None or demos_df.empty:
+                st.caption(":gray[No Calendly bookings for this clinic.]")
+                st.markdown(":gray[—]")
+            else:
+                st.caption(f":gray[{len(demos_df):,} Calendly bookings]")
+                disp = demos_df.rename(columns={"EventStartTime":"When","EventTypeName":"Type","EventSubject":"Subject","InviteeName":"Invitee","InviteeEmail":"Email"})
+                st.dataframe(
+                    disp[["When","Type","Subject","Invitee","Email","Rep","Status","Location"]],
+                    use_container_width=True, hide_index=True,
+                )
+
+        with sub[3]:  # Events
+            df = q("""
+            SELECT ActivityDate, Subject, StartDateTime, Description, OwnerId
+            FROM events WHERE AccountId=? OR WhatId=?
+            ORDER BY ActivityDate DESC NULLS LAST
+            """, (aid, aid))
+            st.caption(f":gray[{len(df):,} events]")
+            if df.empty: st.markdown(":gray[—]")
+            else:
+                ev_disp = df.rename(columns={"ActivityDate": "Date", "OwnerId": "Owner"})[["Date", "Subject", "StartDateTime", "Owner", "Description"]]
+                st.dataframe(
+                    ev_disp, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Date":          st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                        "Subject":       st.column_config.TextColumn(width="large"),
+                        "StartDateTime": st.column_config.TextColumn("Start", width="small"),
+                        "Owner":         st.column_config.TextColumn(width="small"),
+                        "Description":   st.column_config.TextColumn(width="large"),
+                    },
+                )
+
+        with sub[4]:  # Visits
+            wp_df = q("""
+            SELECT w.Id, w.VisitDate, w.ArrivalTime, w.DepartureTime, w.Notes, w.CreatedDate,
+                   u.Name AS Rep, r.Name AS Route,
+                   r.TravelDistance AS RouteMiles, r.TravelTime AS RouteMinutes
+            FROM waypoints w
+            LEFT JOIN users u ON u.Id = w.OwnerId
+            LEFT JOIN maps_routes r ON r.Id = w.RouteId
+            WHERE w.AccountId = ?
+            ORDER BY w.VisitDate DESC NULLS LAST, w.ArrivalTime DESC, w.CreatedDate DESC
+            """, (aid,))
+            st.caption(f":gray[{len(wp_df):,} rep visits to this clinic (from Maps waypoints)]")
+            if wp_df.empty:
+                st.markdown(":gray[No logged in-person visits.]")
+            else:
+                # Surface rep notes prominently before the visit table — these are
+                # rare (14 across the whole backup) but high-signal: KOL IDs,
+                # follow-up status, conversation summaries.
+                with_notes = wp_df[wp_df["Notes"].notna() & (wp_df["Notes"].astype(str).str.strip() != "")]
+                if not with_notes.empty:
+                    st.markdown(":gray[**Rep visit notes**]")
+                    for _, row in with_notes.iterrows():
+                        when = _safe(row.get("VisitDate"), "") or _safe(row.get("CreatedDate"), "")
+                        when = str(when)[:10] if when else "(no date)"
+                        rep = _safe(row.get("Rep"), "Unknown rep")
+                        route = _safe(row.get("Route"), "")
+                        meta = f"{when} &middot; {rep}"
+                        if route: meta += f" &middot; {route}"
+                        note_text = str(row.get("Notes")).strip()
+                        st.markdown(
+                            f"""<div style="border-left:3px solid var(--green); background:var(--surface);
+                                  padding:.6rem .9rem; margin:.4rem 0; border-radius:4px;">
+                                  <div style="font-family:var(--mono); font-size:.72rem;
+                                    color:var(--muted); letter-spacing:.04em; text-transform:uppercase;
+                                    margin-bottom:.3rem;">{meta}</div>
+                                  <div style="color:var(--ink); font-size:.95rem; line-height:1.45;">{note_text}</div>
+                                </div>""",
+                            unsafe_allow_html=True,
+                        )
+                    st.markdown("---")
+
+                disp = wp_df.copy()
+                disp["Visit"] = disp["VisitDate"].astype(str).str.slice(0,10)
+                disp["Arrived"] = disp["ArrivalTime"].astype(str).str.slice(11,16)
+                disp["Left"] = disp["DepartureTime"].astype(str).str.slice(11,16)
+                disp = disp[["Visit","Rep","Arrived","Left","Notes","Route","RouteMiles","RouteMinutes"]]
+                st.dataframe(
+                    disp.rename(columns={"RouteMiles":"Route miles","RouteMinutes":"Route min"}),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "Visit":       st.column_config.TextColumn(width="small"),
+                        "Rep":         st.column_config.TextColumn(width="medium"),
+                        "Arrived":     st.column_config.TextColumn(width="small"),
+                        "Left":        st.column_config.TextColumn(width="small"),
+                        "Notes":       st.column_config.TextColumn(width="large"),
+                        "Route":       st.column_config.TextColumn(width="medium"),
+                        "Route miles": st.column_config.NumberColumn(format="%.1f", width="small"),
+                        "Route min":   st.column_config.NumberColumn(format="%.0f", width="small"),
+                    },
+                )
+
+        with sub[5]:  # Cases
+            df = q("SELECT CaseNumber, Subject, Status, Priority, CreatedDate, ClosedDate FROM cases WHERE AccountId=? ORDER BY CreatedDate DESC", (aid,))
+            st.caption(f":gray[{len(df):,} cases]")
+            if df.empty: st.markdown(":gray[—]")
+            else:
+                st.dataframe(
+                    df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "CaseNumber":  st.column_config.TextColumn("Case #", width="small"),
+                        "Subject":     st.column_config.TextColumn(width="large"),
+                        "Status":      st.column_config.TextColumn(width="small"),
+                        "Priority":    st.column_config.TextColumn(width="small"),
+                        "CreatedDate": st.column_config.DateColumn("Opened", format="YYYY-MM-DD", width="small"),
+                        "ClosedDate":  st.column_config.DateColumn("Closed", format="YYYY-MM-DD", width="small"),
+                    },
+                )
+
+    # ─── Records ───
+    with main_tabs[3]:
+        sub = st.tabs(["Notes", "Chatter", "Files", "History"])
+        with sub[0]:  # Notes
+            # Gather notes whose ParentId is the account, any contact of the account,
+            # or any opportunity of the account. Use OwnerId for author (CreatedById
+            # in this org is a legacy migration user on most rows).
+            notes_df = q("""
+            SELECT n.Id, n.Title, n.Body, n.CreatedDate, n.OwnerId,
+                   u.Name AS AuthorName, n.ParentId
+            FROM notes n
+            LEFT JOIN users u ON u.Id = n.OwnerId
+            WHERE n.IsDeleted = 0 AND (
+                n.ParentId = ?
+                OR n.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                OR n.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
             )
+            ORDER BY n.CreatedDate DESC
+            """, (aid, aid, aid))
+
+            author_counts = q("""
+            SELECT COALESCE(u.Name, '(unknown)') AS AuthorName, COUNT(*) AS n
+            FROM notes n
+            LEFT JOIN users u ON u.Id = n.OwnerId
+            WHERE n.IsDeleted = 0 AND (
+                n.ParentId = ?
+                OR n.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                OR n.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+            )
+            GROUP BY AuthorName
+            ORDER BY n DESC
+            """, (aid, aid, aid))
+
+            st.caption(f":gray[{len(notes_df):,} notes (by Jaclyn, Sarah, and other reps over the clinic's lifetime)]")
+            if notes_df.empty:
+                st.markdown(":gray[No notes on this clinic.]")
+            else:
+                authors = ["All authors"] + [f"{r['AuthorName']} ({r['n']})" for _, r in author_counts.iterrows() if r['AuthorName']]
+                choice = st.selectbox("Filter by author", authors, key=f"note_author_{aid}", label_visibility="collapsed")
+                if choice != "All authors":
+                    target = choice.rsplit(" (", 1)[0]
+                    notes_df = notes_df[notes_df["AuthorName"] == target]
+
+                import html as _html
+                cards = []
+                for _, n in notes_df.iterrows():
+                    title = _safe(n.get("Title"), "")
+                    body  = _safe(n.get("Body"), "")
+                    author = _safe(n.get("AuthorName"), "Unknown")
+                    created = _safe(n.get("CreatedDate"), "")[:10]
+                    # Note bodies can be plain or rich text — strip basic HTML for display
+                    body_plain = (body or "").replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+                    # Render as a card
+                    cards.append(
+                        f'<div class="timeline-row">'
+                        f'<div class="timeline-date">{_html.escape(created) or "—"}</div>'
+                        f'<div class="timeline-card">'
+                        f'<div class="timeline-subject">{_html.escape(title) if title else "(untitled note)"}</div>'
+                        f'<div class="timeline-meta">by {_html.escape(author)}</div>'
+                        f'<div style="margin-top:.5rem; font-family:var(--sans); font-size:.92rem; color:var(--ink); white-space:pre-wrap;">{_html.escape(body_plain)[:2000]}</div>'
+                        f'</div></div>'
+                    )
+                st.html(''.join(cards))
+
+        with sub[1]:  # Chatter
+            try:
+                chatter = q("""
+                SELECT 'Post' AS Kind, fp.Id, fp.Title AS Subj, fp.Body, fp.CreatedDate,
+                       u.Name AS Author, NULL AS Field, NULL AS OldVal, NULL AS NewVal
+                FROM feed_posts fp LEFT JOIN users u ON u.Id = fp.InsertedById
+                WHERE fp.IsDeleted = 0 AND (
+                    fp.ParentId = ?
+                    OR fp.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                    OR fp.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+                )
+                UNION ALL
+                SELECT
+                    CASE WHEN nf.Type = 'TrackedChange' THEN 'Tracked change' ELSE 'NewsFeed' END,
+                    nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name,
+                    ftc.FieldName, ftc.OldValue, ftc.NewValue
+                FROM news_feed nf
+                LEFT JOIN users u ON u.Id = nf.InsertedById
+                LEFT JOIN feed_tracked_change ftc ON ftc.FeedItemId = nf.Id
+                WHERE nf.ParentId = ?
+                   OR nf.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                   OR nf.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+                UNION ALL
+                SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name,
+                       NULL, NULL, NULL
+                FROM feed_comments fc LEFT JOIN users u ON u.Id = fc.InsertedById
+                WHERE fc.IsDeleted = 0 AND (
+                    fc.ParentId = ?
+                    OR fc.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                    OR fc.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+                )
+                ORDER BY CreatedDate DESC LIMIT 500
+                """, (aid,)*9)
+            except Exception:
+                chatter = None
+            if chatter is None or chatter.empty:
+                st.caption(":gray[No Chatter activity in the snapshot.]")
+                st.markdown(":gray[—]")
+            else:
+                st.caption(f":gray[{len(chatter):,} Chatter entries (posts, news feed, comments)]")
+                import html as _html
+                rows_html = []
+                for _, c in chatter.iterrows():
+                    kind = _safe(c.get("Kind"), "")
+                    subj = _safe(c.get("Subj"), "")
+                    body = _safe(c.get("Body"), "")
+                    author = _safe(c.get("Author"), "Unknown")
+                    created = _safe(c.get("CreatedDate"), "")[:10]
+                    field = _safe(c.get("Field"), "")
+                    old_v = _safe(c.get("OldVal"), "")
+                    new_v = _safe(c.get("NewVal"), "")
+                    # For TrackedChange rows, the human-readable detail is in field/old/new
+                    if kind == "Tracked change" and field:
+                        subj_html = f"{_html.escape(field)}: {_html.escape(old_v) or '—'} &rarr; {_html.escape(new_v) or '—'}"
+                    else:
+                        subj_html = _html.escape(subj or "(no title)")[:200]
+                    body_plain = (body or "").replace("<br>", "\n").replace("<br/>", "\n")
+                    rows_html.append(
+                        f'<div class="timeline-row">'
+                        f'<div class="timeline-date">{_html.escape(created) or "—"}</div>'
+                        f'<div class="timeline-card">'
+                        f'<div class="timeline-subject">{subj_html}</div>'
+                        f'<div class="timeline-meta">{_html.escape(kind)} &middot; {_html.escape(author)}</div>'
+                        f'<div style="margin-top:.4rem; font-family:var(--sans); font-size:.9rem; color:var(--ink); white-space:pre-wrap;">{_html.escape(body_plain)[:1500]}</div>'
+                        f'</div></div>'
+                    )
+                st.html(''.join(rows_html))
+
+        with sub[2]:  # Files
+            # Files tied to this clinic via ContentDocumentLink:
+            # - Direct on Account
+            # - Files on any Opportunity of this account
+            # - Files on any Contact of this account
+            # - Files on any Task tied to this account
+            files_df = q("""
+            SELECT fb.content_version_id, fb.parent_id, fb.parent_type,
+                   fb.title, fb.extension, fb.size_bytes, fb.is_inline, fb.release_bucket
+            FROM file_blobs fb
+            WHERE fb.parent_id = ?
+               OR fb.parent_id IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+               OR fb.parent_id IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+               OR fb.parent_id IN (SELECT Id FROM tasks WHERE AccountId = ? OR WhatId = ?)
+            ORDER BY fb.is_inline DESC, fb.title COLLATE NOCASE
+            """, (aid, aid, aid, aid, aid))
+            st.caption(f":gray[{len(files_df):,} files in the Salesforce backup]")
+            RELEASE_BASE = "https://github.com/alexanderjordain/oncura-sf-database/releases/download/files-2026-03-25-"
+            if files_df.empty:
+                st.markdown(":gray[No files on this clinic in the backup.]")
+            else:
+                for _, f in files_df.iterrows():
+                    title = _safe(f.get("title"), "(untitled)")
+                    ext = _safe(f.get("extension"), "bin") or "bin"
+                    cv_id = f.get("content_version_id")
+                    bucket = f.get("release_bucket") or "a"
+                    size_kb = (f.get("size_bytes") or 0) / 1024
+                    size_str = f"{size_kb:,.0f} KB" if size_kb < 1024 else f"{size_kb/1024:,.1f} MB"
+                    parent_type = f.get("parent_type") or ""
+                    parent_label = {"001": "Account", "003": "Contact", "006": "Opportunity", "00T": "Task", "002": "Note"}.get(parent_type, parent_type)
+                    col_main, col_action = st.columns([5, 1])
+                    col_main.markdown(f"**{title}.{ext}** · :gray[{size_str} · {parent_label}]")
+                    col_action.link_button("Download", f"{RELEASE_BASE}{bucket}/{cv_id}.{ext}", use_container_width=True)
+
+            # Legacy Salesforce Attachments (pre-Files architecture). Binary not in
+            # the backup snapshot, but the metadata documents what existed.
+            att_df = q("""
+            SELECT Name, ContentType, BodyLength, Description, CreatedDate, CreatedById, ParentId
+            FROM attachments
+            WHERE (AccountId = ? OR ParentId = ?
+                   OR ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+                   OR ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+                   OR ParentId IN (SELECT Id FROM tasks WHERE AccountId = ? OR WhatId = ?))
+                  AND IsDeleted = 0
+            ORDER BY CreatedDate DESC
+            """, (aid, aid, aid, aid, aid, aid))
+            if not att_df.empty:
+                st.markdown("---")
+                st.markdown(f":gray[**Legacy attachments** &middot; {len(att_df):,} pre-Files attachments (metadata only — binaries not in this snapshot)]")
+                disp = att_df.copy()
+                disp["When"] = disp["CreatedDate"].str.slice(0, 10)
+                disp["Size"] = disp["BodyLength"].fillna(0).apply(
+                    lambda b: f"{b/1024:,.0f} KB" if b and b < 1024*1024 else (f"{b/1024/1024:,.1f} MB" if b else "")
+                )
+                disp = disp[["When","Name","ContentType","Size","Description"]]
+                st.dataframe(
+                    disp, use_container_width=True, hide_index=True,
+                    column_config={
+                        "When":        st.column_config.TextColumn(width="small"),
+                        "Name":        st.column_config.TextColumn(width="large"),
+                        "ContentType": st.column_config.TextColumn("Type", width="small"),
+                        "Size":        st.column_config.TextColumn(width="small"),
+                        "Description": st.column_config.TextColumn(width="medium"),
+                    },
+                )
+
+        with sub[3]:  # History
+            try:
+                df = q("SELECT CreatedDate, Field, OldValue, NewValue, CreatedById FROM account_history WHERE AccountId=? ORDER BY CreatedDate DESC LIMIT 500", (aid,))
+            except Exception:
+                df = None
+            if df is None or df.empty:
+                st.caption(":gray[No history data in this snapshot.]")
+                st.markdown(":gray[—]")
+            else:
+                st.caption(f":gray[{len(df):,} history changes · most recent 500]")
+                df["CreatedDate"] = df["CreatedDate"].str.slice(0, 19)
+                st.dataframe(
+                    df.rename(columns={"CreatedById": "By"}),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "CreatedDate": st.column_config.TextColumn("Changed at", width="small"),
+                        "Field":       st.column_config.TextColumn(width="small"),
+                        "OldValue":    st.column_config.TextColumn("From", width="medium"),
+                        "NewValue":    st.column_config.TextColumn("To",   width="medium"),
+                        "By":          st.column_config.TextColumn(width="small"),
+                    },
+                )
+
 
 # ───────────────────── PAGE: Sales activity ─────────────────────
 def page_activity():
