@@ -30,8 +30,8 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v8.db")
-    MIN_BYTES = 1_080_000_000  # the v8 DB is ~1.1 GB (full task descriptions restored)
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v9.db")
+    MIN_BYTES = 1_160_000_000  # the v9 DB is ~1.2 GB (fixed ETL mappings + 5 new tables + 80+ restored columns)
     if os.path.exists(target) and os.path.getsize(target) >= MIN_BYTES:
         # Sanity check: can SQLite open it + does it have the expected columns?
         try:
@@ -39,6 +39,9 @@ def _resolve_db_path() -> str:
             _c = _sq.connect(target)
             _c.execute("SELECT AccountId FROM attachments LIMIT 1")
             _c.execute("SELECT 1 FROM maps_routes LIMIT 1")
+            _c.execute("SELECT 1 FROM contact_monthly_metric LIMIT 1")
+            _c.execute("SELECT Field FROM entity_history WHERE Field IS NOT NULL LIMIT 1")
+            _c.execute("SELECT Partner FROM accounts LIMIT 1")
             _c.close()
             return target
         except Exception:
@@ -47,7 +50,7 @@ def _resolve_db_path() -> str:
 
     import urllib.request, tempfile, shutil
     info = st.empty()
-    info.info("Loading the Salesforce snapshot database… (first launch only, ~1.1 GB — takes 2–3 min)")
+    info.info("Loading the Salesforce snapshot database… (first launch only, ~1.2 GB — takes 2–3 min)")
     tmp = target + ".tmp"
     try:
         with urllib.request.urlopen(DB_URL) as r, open(tmp, "wb") as out:
@@ -202,6 +205,29 @@ footer { visibility:hidden; }
 /* ── Pills + cards (Salesforce-flavored detail view) ─────────────────── */
 .partner-pill { display:inline-block; padding:.05rem .55rem; border-radius:999px; background:#DFF5E1; color:#1B6E3A; font-weight:600; font-size:.78rem; font-family:var(--sans); }
 .lead-pill    { display:inline-block; padding:.05rem .55rem; border-radius:999px; background:#F2F2F2; color:#6B7785; font-weight:500; font-size:.78rem; font-family:var(--sans); }
+
+/* Status chips for clinic header */
+.chip-row { display:flex; flex-wrap:wrap; gap:.4rem; margin:.4rem 0 .9rem 0; }
+.chip { display:inline-flex; align-items:center; gap:.3rem; padding:.18rem .55rem; border-radius:999px; font-weight:600; font-size:.74rem; font-family:var(--sans); letter-spacing:.01em; border:1px solid transparent; }
+.chip-good { background:#DFF5E1; color:#1B6E3A; border-color:#B7E2BD; }
+.chip-warn { background:#FBE9C5; color:#8B5A0F; border-color:#EFCB78; }
+.chip-bad  { background:#F4D9D9; color:#9C2727; border-color:#E2A0A0; }
+.chip-info { background:#E1ECF7; color:#2F567E; border-color:#B9D0E6; }
+.chip-vip  { background:#F5E0F8; color:#7A2A86; border-color:#D9B0E0; }
+.chip-mute { background:#F2F2F2; color:#6B7785; border-color:#DDD; }
+
+/* Compliance chips on contact cards */
+.compliance-chip { display:inline-block; padding:.05rem .45rem; margin-right:.25rem; border-radius:4px; font-size:.7rem; font-family:var(--mono); letter-spacing:.04em; }
+.cc-dnc  { background:#F4D9D9; color:#9C2727; }
+.cc-oo   { background:#FBE9C5; color:#8B5A0F; }
+.cc-grade-A { background:#DFF5E1; color:#1B6E3A; }
+.cc-grade-B { background:#E1ECF7; color:#2F567E; }
+.cc-grade-C { background:#FBE9C5; color:#8B5A0F; }
+.cc-grade-D { background:#F4D9D9; color:#9C2727; }
+.cc-grade-F { background:#F4D9D9; color:#9C2727; }
+.cc-bounce { background:#F4D9D9; color:#9C2727; }
+.cc-noatcompany { background:#F2F2F2; color:#6B7785; text-decoration:line-through; }
+.cc-primary { background:#F5E0F8; color:#7A2A86; }
 
 /* Stage badges on opportunities */
 .stage-won  { display:inline-block; padding:.1rem .55rem; border-radius:999px; background:#DFF5E1; color:#1B6E3A; font-weight:600; font-size:.78rem; font-family:var(--sans); }
@@ -630,10 +656,22 @@ def page_detail():
         if acct.get("Partner") else
         '<span class="lead-pill">Non-Partner</span>'
     )
+    # Parent / corporate-group breadcrumb if present
+    parent_html = ""
+    parent_id = acct.get("ParentId")
+    corp_group = acct.get("Corporate_Group")
+    if parent_id:
+        parent_row = one("SELECT Name FROM accounts WHERE Id=?", (parent_id,))
+        if parent_row:
+            parent_html = f' &middot; Parent: <code>{_safe(parent_row.get("Name"), parent_id)}</code>'
+    elif corp_group:
+        parent_html = f' &middot; Corporate Group: <code>{_safe(corp_group, "")}</code>'
+
     sub = (
         f"SF Account: <code>{acct['Id']}</code> &middot; "
         f"Hospital ID: <code>{acct.get('Hospital_ID') or '—'}</code> &middot; "
         f"{partner_pill}"
+        f"{parent_html}"
     )
     # Custom header so we can include HTML in the subtitle
     st.markdown(
@@ -646,6 +684,50 @@ def page_detail():
     if nav1.button(":material/arrow_back: Back to search", use_container_width=True):
         goto_search()
 
+    # ── Status chips row ──
+    # Surface high-signal binary states + countdowns the rep needs at a glance.
+    import datetime as _dt
+    import html as _html
+    def _days_until(date_str):
+        if not date_str: return None
+        try:
+            d = _dt.date.fromisoformat(str(date_str)[:10])
+            today = _dt.date.fromisoformat("2026-06-22")
+            return (d - today).days
+        except Exception:
+            return None
+    chips = []
+    if acct.get("VIP"):                chips.append('<span class="chip chip-vip">★ VIP</span>')
+    if acct.get("Past_Due"):           chips.append('<span class="chip chip-bad">⚠ Past Due</span>')
+    if acct.get("Compliant") == 1:     chips.append('<span class="chip chip-good">✓ Compliant</span>')
+    elif acct.get("Compliant") == 0 and acct.get("Partner"): chips.append('<span class="chip chip-warn">⌀ Non-compliant</span>')
+    if acct.get("Has_Ultrasound"):     chips.append('<span class="chip chip-info">Has US</span>')
+    tier = acct.get("Clinic_Performance_Tier")
+    if tier:                           chips.append(f'<span class="chip chip-info">Tier: {_html.escape(str(tier))}</span>')
+    ps  = acct.get("Practice_Specialty")
+    if ps:                             chips.append(f'<span class="chip chip-mute">{_html.escape(str(ps))}</span>')
+    spk = acct.get("Scan_Package")
+    if spk and str(spk).strip():       chips.append(f'<span class="chip chip-info">Pkg: {_html.escape(str(spk))}</span>')
+    # Contract end-date countdowns
+    for label, d_field in [
+        ("Pkg ends",   "Scan_Package_End_Date"),
+        ("EMA support", "EMA_Support_End_Date"),
+        ("EMA hardware", "EMA_Hardware_End_Date"),
+    ]:
+        d = acct.get(d_field)
+        days = _days_until(d)
+        if days is not None:
+            d_str = str(d)[:10]
+            if days < 0:     css = "chip-bad";  suffix = f"{-days}d overdue"
+            elif days < 30:  css = "chip-warn"; suffix = f"in {days}d"
+            elif days < 90:  css = "chip-info"; suffix = f"in {days}d"
+            else:            css = "chip-mute"; suffix = d_str
+            chips.append(f'<span class="chip {css}">{label}: {suffix}</span>')
+    if chips:
+        chips_html = '<div class="chip-row">' + ''.join(chips) + '</div>'
+        # Streamlit's :material/...: syntax only works in st.markdown not st.html; use markdown
+        st.markdown(chips_html, unsafe_allow_html=True)
+
     # Highlights row (Salesforce-style)
     addr = ", ".join([x for x in [acct.get("BillingStreet"), acct.get("BillingCity"), acct.get("BillingState"), acct.get("BillingPostalCode")] if x])
     owner = one("SELECT Name, Email, IsActive FROM users WHERE Id=?", (acct.get("OwnerId"),))
@@ -653,8 +735,10 @@ def page_detail():
     won_total = one("SELECT COALESCE(SUM(Amount),0) AS t FROM opportunities WHERE AccountId=? AND IsWon=1", (aid,))["t"]
     n_contacts = one("SELECT COUNT(*) AS c FROM contacts WHERE AccountId=? AND IsDeleted=0", (aid,))["c"]
     n_opps = one("SELECT COUNT(*) AS c FROM opportunities WHERE AccountId=?", (aid,))["c"]
+    rcs = acct.get("Regional_Clinical_Specialist")
+    n_docs = acct.get("Number_of_Doctors")
+    n_docs_label = f"{int(n_docs)}" if n_docs else "—"
 
-    import html as _html
     def _hc(label, value):
         return (f'<div class="highlight-card"><div class="label">{_html.escape(label)}</div>'
                 f'<div class="value">{_html.escape(str(value)) if value not in (None,"") else "—"}</div></div>')
@@ -664,10 +748,14 @@ def page_detail():
         + _hc("Phone", acct.get('Phone'))
         + _hc("Install · System", f"{fmt_date(acct.get('US_Install_Date'))} · {acct.get('Ultrasound_System') or '—'}")
         + _hc("Owner", owner_label)
+        + _hc("RCS", rcs)
+        + _hc("Doctors", n_docs_label)
         + _hc("Contacts", f"{n_contacts:,}")
         + _hc("Opportunities", f"{n_opps:,}")
         + _hc("Closed-Won $", fmt_money(won_total))
         + _hc("Territory", acct.get('Territory'))
+        + _hc("Last OSR visit", fmt_date(acct.get('Last_OSR_Call_Visit')))
+        + _hc("Website", acct.get('Website'))
         + '</div>'
     )
     st.html(highlights_html)
@@ -679,7 +767,13 @@ def page_detail():
         sub = st.tabs(["Contacts", "Campaigns"])
         with sub[0]:  # Contacts
             df = q("""
-            SELECT Id, Name, FirstName, LastName, Title, Email, Phone
+            SELECT Id, Name, FirstName, LastName, Title, Department,
+                   Email, Phone, MobilePhone,
+                   HasOptedOutOfEmail, DoNotCall, EmailBouncedDate, EmailBouncedReason,
+                   No_longer_at_Company, Primary_Contact,
+                   pi_grade, pi_score, pi_last_activity,
+                   Certification, Cardiac_Certification,
+                   MailingCity, MailingState
             FROM contacts WHERE AccountId=? AND IsDeleted=0
             ORDER BY LastName COLLATE NOCASE, FirstName COLLATE NOCASE
             """, (aid,))
@@ -692,26 +786,129 @@ def page_detail():
                 for _, c in df.iterrows():
                     name = _safe(c.get('Name'), '').strip() or f"{_safe(c.get('FirstName'),'')} {_safe(c.get('LastName'),'')}".strip() or '(no name)'
                     title = _safe(c.get('Title'), '')
+                    dept = _safe(c.get('Department'), '')
                     email = _safe(c.get('Email'), '')
                     phone = _safe(c.get('Phone'), '')
+                    mobile = _safe(c.get('MobilePhone'), '')
+                    city_state = ', '.join([x for x in [_safe(c.get('MailingCity'),''), _safe(c.get('MailingState'),'')] if x])
                     initials = ''.join([p[0] for p in name.split() if p][:2]).upper() or '?'
+
+                    # Compliance / scoring chips
+                    chip_html = []
+                    if c.get('No_longer_at_Company'): chip_html.append('<span class="compliance-chip cc-noatcompany">No longer at co</span>')
+                    if c.get('Primary_Contact'):     chip_html.append('<span class="compliance-chip cc-primary">PRIMARY</span>')
+                    if c.get('DoNotCall'):           chip_html.append('<span class="compliance-chip cc-dnc">DO NOT CALL</span>')
+                    if c.get('HasOptedOutOfEmail'): chip_html.append('<span class="compliance-chip cc-oo">opted-out email</span>')
+                    if c.get('EmailBouncedDate'):   chip_html.append(f'<span class="compliance-chip cc-bounce">bounced</span>')
+                    g = _safe(c.get('pi_grade'), '')
+                    if g: chip_html.append(f'<span class="compliance-chip cc-grade-{_html.escape(g[0].upper())}">Grade {_html.escape(g)}</span>')
+                    cert = _safe(c.get('Certification'), '')
+                    if cert: chip_html.append(f'<span class="compliance-chip cc-grade-A">{_html.escape(cert)}</span>')
+                    cardiac = _safe(c.get('Cardiac_Certification'), '')
+                    if cardiac: chip_html.append(f'<span class="compliance-chip cc-grade-A">Cardiac: {_html.escape(cardiac)}</span>')
+
+                    chip_row = ('<div style="margin-top:.25rem;">' + ''.join(chip_html) + '</div>') if chip_html else ''
+
                     meta_parts = []
-                    if email:
-                        meta_parts.append(f'<a href="mailto:{_html.escape(email)}">{_html.escape(email)}</a>')
-                    if phone:
-                        meta_parts.append(_html.escape(phone))
+                    if email:  meta_parts.append(f'<a href="mailto:{_html.escape(email)}">{_html.escape(email)}</a>')
+                    if phone:  meta_parts.append(f'☎ {_html.escape(phone)}')
+                    if mobile and mobile != phone: meta_parts.append(f'📱 {_html.escape(mobile)}')
+                    if city_state: meta_parts.append(_html.escape(city_state))
                     meta = ' &middot; '.join(meta_parts) if meta_parts else '—'
+
+                    title_html = _html.escape(title) if title else "&nbsp;"
+                    if dept and dept != title:
+                        title_html = f"{title_html} <span style='color:var(--muted)'>· {_html.escape(dept)}</span>"
+
                     cards.append(
                         f'<div class="contact-card">'
                         f'<div class="contact-avatar">{_html.escape(initials)}</div>'
                         f'<div>'
                         f'<div class="contact-name">{_html.escape(name)}</div>'
-                        f'<div class="contact-title">{_html.escape(title) if title else "&nbsp;"}</div>'
+                        f'<div class="contact-title">{title_html}</div>'
                         f'<div class="contact-meta">{meta}</div>'
+                        f'{chip_row}'
                         f'</div>'
                         f'</div>'
                     )
                 st.html(''.join(cards))
+
+                # Engagement panel — aggregate the last 12 months of email/call activity
+                # per contact from contact_monthly_metric.
+                with st.expander(":gray[Email & call engagement (last 12 months per contact)]"):
+                    eng = q("""
+                    SELECT c.Name AS Contact, c.Title,
+                           SUM(COALESCE(m.EmailsSent,0))     AS EmailsSent,
+                           SUM(COALESCE(m.EmailsOpened,0))   AS Opens,
+                           SUM(COALESCE(m.EmailsClicked,0))  AS Clicks,
+                           SUM(COALESCE(m.EmailsReplied,0))  AS Replies,
+                           SUM(COALESCE(m.EmailsHardBounced,0)+COALESCE(m.EmailsSoftBounced,0)) AS Bounces,
+                           SUM(COALESCE(m.CallsConnect,0))   AS CallsConnected,
+                           SUM(COALESCE(m.CallsLeftVoicemail,0)) AS Voicemails,
+                           MAX(m.EndDateTime)                AS LastActivityWindow
+                    FROM contacts c
+                    LEFT JOIN contact_monthly_metric m
+                      ON m.ContactId = c.Id AND m.Month >= date('2025-06-01')
+                    WHERE c.AccountId=? AND c.IsDeleted=0
+                    GROUP BY c.Id
+                    ORDER BY (Opens+Clicks+Replies+CallsConnected) DESC, c.Name
+                    """, (aid,))
+                    eng = eng.dropna(subset=['Contact'])
+                    if eng.empty or eng[['EmailsSent','CallsConnected','Voicemails']].sum().sum() == 0:
+                        st.caption(":gray[No tracked email or call activity for contacts at this clinic.]")
+                    else:
+                        st.dataframe(
+                            eng[['Contact','Title','EmailsSent','Opens','Clicks','Replies','Bounces','CallsConnected','Voicemails','LastActivityWindow']],
+                            use_container_width=True, hide_index=True,
+                            column_config={
+                                'Contact':            st.column_config.TextColumn(width='medium'),
+                                'Title':              st.column_config.TextColumn(width='medium'),
+                                'EmailsSent':         st.column_config.NumberColumn('Emails sent', width='small'),
+                                'Opens':              st.column_config.NumberColumn(width='small'),
+                                'Clicks':             st.column_config.NumberColumn(width='small'),
+                                'Replies':            st.column_config.NumberColumn(width='small'),
+                                'Bounces':            st.column_config.NumberColumn(width='small'),
+                                'CallsConnected':     st.column_config.NumberColumn('Calls conn.', width='small'),
+                                'Voicemails':         st.column_config.NumberColumn('VM', width='small'),
+                                'LastActivityWindow': st.column_config.TextColumn('Latest window', width='small'),
+                            },
+                        )
+
+                # Website behavioral panel from HubSpot Intelligence
+                with st.expander(":gray[Website / lead behavior (HubSpot Intelligence)]"):
+                    hi = q("""
+                    SELECT c.Name AS Contact, h.LeadGrade,
+                           h.WebsiteVisits, h.TotalPageViews, h.UniquePagesViewed, h.AveragePageViews,
+                           h.FirstConversionDate, h.FirstConversionEvent,
+                           h.RecentConversionDate, h.RecentConversionEvent,
+                           h.RecentVisit, h.FoundSiteVia, h.IPCity, h.IPState
+                    FROM contacts c
+                    JOIN hubspot_intelligence h ON h.ContactId = c.Id
+                    WHERE c.AccountId=? AND c.IsDeleted=0
+                    ORDER BY h.WebsiteVisits DESC NULLS LAST
+                    """, (aid,))
+                    if hi.empty:
+                        st.caption(":gray[No HubSpot web-tracking on contacts at this clinic.]")
+                    else:
+                        st.dataframe(
+                            hi, use_container_width=True, hide_index=True,
+                            column_config={
+                                'Contact':              st.column_config.TextColumn(width='medium'),
+                                'LeadGrade':            st.column_config.TextColumn('Grade', width='small'),
+                                'WebsiteVisits':        st.column_config.NumberColumn('Visits', width='small'),
+                                'TotalPageViews':       st.column_config.NumberColumn('Pageviews', width='small'),
+                                'UniquePagesViewed':    st.column_config.NumberColumn('Unique pages', width='small'),
+                                'AveragePageViews':     st.column_config.NumberColumn('Avg pv/visit', width='small'),
+                                'FirstConversionDate':  st.column_config.DateColumn('1st convert', format='YYYY-MM-DD', width='small'),
+                                'FirstConversionEvent': st.column_config.TextColumn('1st event', width='medium'),
+                                'RecentConversionDate': st.column_config.DateColumn('Last convert', format='YYYY-MM-DD', width='small'),
+                                'RecentConversionEvent':st.column_config.TextColumn('Last event', width='medium'),
+                                'RecentVisit':          st.column_config.TextColumn('Last visit', width='small'),
+                                'FoundSiteVia':         st.column_config.TextColumn('Found via', width='medium'),
+                                'IPCity':               st.column_config.TextColumn('IP city', width='small'),
+                                'IPState':              st.column_config.TextColumn('IP state', width='small'),
+                            },
+                        )
 
         with sub[1]:  # Campaigns
             camp_df = q("""
@@ -859,8 +1056,12 @@ def page_detail():
             with col_a:
                 st.markdown(":gray[**Installed equipment**]")
                 assets_df = q("""
-                SELECT a.Name, a.SerialNumber, a.Status, a.InstallDate, a.PurchaseDate,
-                       a.Description, p.Name AS Product, c.Name AS Contact
+                SELECT a.Name, a.SerialNumber, a.AssetSerialNumber, a.AssetPartNumber,
+                       a.Ultrasound_System, a.Status, a.InstallDate, a.PurchaseDate, a.ShippedDate,
+                       a.UsageEndDate, a.Price, a.Description,
+                       a.City, a.State, a.IsCompetitorProduct,
+                       a.Synced_EMA_Contract, a.Synced_Probe_Contract, a.Synced_SSA_Contract,
+                       p.Name AS Product, c.Name AS Contact
                 FROM assets a
                 LEFT JOIN products p ON p.Id = a.Product2Id
                 LEFT JOIN contacts c ON c.Id = a.ContactId
@@ -870,16 +1071,59 @@ def page_detail():
                 if assets_df.empty:
                     st.markdown(":gray[—]")
                 else:
+                    disp_a = assets_df.copy()
+                    disp_a["Location"] = disp_a.apply(
+                        lambda r: ', '.join([x for x in [_safe(r.get('City'),''), _safe(r.get('State'),'')] if x]) or None,
+                        axis=1
+                    )
+                    disp_a["SN"] = disp_a["SerialNumber"].fillna(disp_a["AssetSerialNumber"])
+                    disp_a["Comp?"] = disp_a["IsCompetitorProduct"].map({1:"⚠ comp", 0:""}).fillna("")
+                    disp_a = disp_a[[
+                        "Name","Product","Ultrasound_System","SN","AssetPartNumber",
+                        "Status","InstallDate","ShippedDate","UsageEndDate","Price",
+                        "Location","Contact","Comp?",
+                        "Synced_EMA_Contract","Synced_Probe_Contract","Synced_SSA_Contract",
+                    ]]
                     st.dataframe(
-                        assets_df.rename(columns={"InstallDate":"Installed","PurchaseDate":"Purchased","SerialNumber":"S/N"}),
+                        disp_a.rename(columns={
+                            "AssetPartNumber":"Part #",
+                            "Ultrasound_System":"US System",
+                            "InstallDate":"Installed","ShippedDate":"Shipped","UsageEndDate":"Usage end",
+                            "Synced_EMA_Contract":"EMA contract",
+                            "Synced_Probe_Contract":"Probe contract",
+                            "Synced_SSA_Contract":"SSA contract",
+                        }),
                         use_container_width=True, hide_index=True,
                         column_config={
-                            "Installed":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                            "Purchased":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-                            "Name":       st.column_config.TextColumn(width="medium"),
-                            "Product":    st.column_config.TextColumn(width="medium"),
-                            "Status":     st.column_config.TextColumn(width="small"),
-                            "S/N":        st.column_config.TextColumn(width="small"),
+                            "Name":           st.column_config.TextColumn(width="medium"),
+                            "Product":        st.column_config.TextColumn(width="medium"),
+                            "US System":      st.column_config.TextColumn(width="small"),
+                            "SN":             st.column_config.TextColumn("S/N", width="small"),
+                            "Part #":         st.column_config.TextColumn(width="small"),
+                            "Status":         st.column_config.TextColumn(width="small"),
+                            "Installed":      st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                            "Shipped":        st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                            "Usage end":      st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+                            "Price":          st.column_config.NumberColumn(format="$%d", width="small"),
+                            "Location":       st.column_config.TextColumn(width="small"),
+                            "Contact":        st.column_config.TextColumn(width="medium"),
+                            "Comp?":          st.column_config.TextColumn(width="small"),
+                            "EMA contract":   st.column_config.TextColumn(width="small"),
+                            "Probe contract": st.column_config.TextColumn(width="small"),
+                            "SSA contract":   st.column_config.TextColumn(width="small"),
+                        },
+                    )
+
+                # Serial numbers (ultrasound device serials, separate table)
+                sn_df = q("SELECT Name, CreatedDate FROM serial_numbers WHERE AccountId=? AND IsDeleted=0 ORDER BY CreatedDate DESC", (aid,))
+                if not sn_df.empty:
+                    st.markdown(":gray[**Additional serial numbers**]")
+                    st.dataframe(
+                        sn_df.rename(columns={"Name":"Serial #","CreatedDate":"Recorded"}),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "Serial #": st.column_config.TextColumn(width="medium"),
+                            "Recorded": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
                         },
                     )
 
@@ -934,9 +1178,76 @@ def page_detail():
                         },
                     )
 
+            # Contracts — execution timeline below the two-column equipment grid
+            st.markdown(":gray[**Contracts**]")
+            ct_df = q("""
+            SELECT Name, ContractNumber, Contract_Type, Status, StatusCode,
+                   StartDate, ActivatedDate, CompanySignedDate, CustomerSignedDate,
+                   CustomerSignedTitle, ContractTerm, Shipped,
+                   ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode,
+                   Description, SpecialTerms
+            FROM contracts WHERE AccountId=? AND IsDeleted=0
+            ORDER BY COALESCE(ActivatedDate, CustomerSignedDate, StartDate, CreatedDate) DESC
+            """, (aid,))
+            if ct_df.empty:
+                st.markdown(":gray[—]")
+            else:
+                import html as _html
+                cards = []
+                for _, c in ct_df.iterrows():
+                    name = _safe(c.get('Name'), 'Contract')
+                    num  = _safe(c.get('ContractNumber'), '')
+                    ctyp = _safe(c.get('Contract_Type'), '')
+                    status = _safe(c.get('Status'), '')
+                    term = c.get('ContractTerm')
+                    term_s = f"{int(term)} mo" if term else ""
+                    company_signed = str(_safe(c.get('CompanySignedDate'), ''))[:10]
+                    cust_signed    = str(_safe(c.get('CustomerSignedDate'), ''))[:10]
+                    activated      = str(_safe(c.get('ActivatedDate'), ''))[:10]
+                    start_         = str(_safe(c.get('StartDate'), ''))[:10]
+                    shipped        = c.get('Shipped')
+                    cust_title     = _safe(c.get('CustomerSignedTitle'), '')
+                    ship_addr      = ', '.join([x for x in [_safe(c.get('ShippingCity'),''), _safe(c.get('ShippingState'),''), _safe(c.get('ShippingPostalCode'),'')] if x])
+
+                    timeline_chips = []
+                    for label, val in [
+                        ("Start", start_),
+                        ("Co. signed", company_signed),
+                        ("Customer signed", cust_signed),
+                        ("Activated", activated),
+                    ]:
+                        if val and val != "None":
+                            timeline_chips.append(f'<span class="chip chip-info">{label}: {_html.escape(val)}</span>')
+                    if term_s:    timeline_chips.append(f'<span class="chip chip-mute">{_html.escape(term_s)}</span>')
+                    if shipped:   timeline_chips.append('<span class="chip chip-good">Shipped</span>')
+                    if status:    timeline_chips.append(f'<span class="chip chip-info">{_html.escape(status)}</span>')
+
+                    detail_lines = []
+                    if cust_title:  detail_lines.append(f'<b>Signed by:</b> {_html.escape(cust_title)}')
+                    if ctyp:        detail_lines.append(f'<b>Type:</b> {_html.escape(ctyp)}')
+                    if ship_addr:   detail_lines.append(f'<b>Ship to:</b> {_html.escape(ship_addr)}')
+                    if _safe(c.get('Description'), ''):
+                        detail_lines.append(f'<b>Description:</b> {_html.escape(_safe(c.get("Description"),"")[:400])}')
+                    if _safe(c.get('SpecialTerms'), ''):
+                        detail_lines.append(f'<b>Special terms:</b> {_html.escape(_safe(c.get("SpecialTerms"),"")[:400])}')
+                    detail_html = '<br>'.join(detail_lines)
+
+                    cards.append(
+                        f'<div style="background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--green);'
+                        f' border-radius:6px; padding:.55rem .8rem; margin-bottom:.4rem;">'
+                        f'<div style="display:flex; justify-content:space-between; align-items:baseline;">'
+                        f'<div style="font-weight:600; color:var(--ink); font-family:var(--sans);">{_html.escape(name)}</div>'
+                        f'<div style="font-family:var(--mono); font-size:.7rem; color:var(--muted);">{_html.escape(num)}</div>'
+                        f'</div>'
+                        f'<div style="margin:.3rem 0;">{"".join(timeline_chips)}</div>'
+                        f'{("<div style=\"font-size:.88rem; color:var(--ink);\">" + detail_html + "</div>") if detail_html else ""}'
+                        f'</div>'
+                    )
+                st.html(''.join(cards))
+
     # ─── Touchpoints ───
     with main_tabs[2]:
-        sub = st.tabs(["Activities", "Emails", "Demos", "Events", "Visits", "Cases"])
+        sub = st.tabs(["Activities", "Calls", "SMS", "Emails", "Demos", "Events", "Visits", "Cases"])
         with sub[0]:  # Activities
             # Expanded coverage: catch tasks tied to the clinic via any of —
             #   direct AccountId, WhatId=Account/Opportunity, WhoId=Contact,
@@ -1043,7 +1354,122 @@ def page_detail():
                         if desc:
                             st.text(desc)
 
-        with sub[1]:  # Emails
+        with sub[1]:  # Calls — Dialpad phone calls
+            # call_logs has no AccountId — it's tied via ParentObjectId which
+            # can be an Account, Contact, Lead, or Opportunity.
+            calls_df = q("""
+            SELECT cl.CreatedDate, cl.ActivityDate, cl.AgentName,
+                   cl.CallFrom, cl.CallTo, cl.CallType,
+                   cl.CallDuration, cl.ConnectedDuration,
+                   cl.CallDisposition, cl.CallDispositionPicklist,
+                   cl.CallDispositionNotes,
+                   cl.AICallPurpose, cl.AIOutcome, cl.AICSAT, cl.AIPlaybookAdherence,
+                   cl.AISummary, cl.AIActionItems, cl.Comments,
+                   cl.RecordingURL, cl.CallStartTime, cl.CallEndTime,
+                   cl.ParentObjectId, cl.ObjectName, cl.TargetName,
+                   cl.Subject, cl.Status, cl.Type
+            FROM call_logs cl
+            WHERE cl.ParentObjectId = ?
+               OR cl.ParentObjectId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+               OR cl.ParentObjectId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+               OR cl.RelatedObjectIds LIKE ?
+            ORDER BY cl.ActivityDate DESC NULLS LAST, cl.CreatedDate DESC
+            """, (aid, aid, aid, f'%{aid}%'))
+            st.caption(f":gray[{len(calls_df):,} Dialpad calls]")
+            if calls_df.empty:
+                st.markdown(":gray[No Dialpad call logs tied to this clinic.]")
+            else:
+                import html as _html
+                rows_html = []
+                for _, r in calls_df.iterrows():
+                    when = str(_safe(r.get('ActivityDate'), '') or _safe(r.get('CreatedDate'), ''))[:16].replace('T',' ')
+                    agent = _safe(r.get('AgentName'), '') or _safe(r.get('TargetName'), '')
+                    from_  = _safe(r.get('CallFrom'), '')
+                    to_    = _safe(r.get('CallTo'), '')
+                    ctype  = (_safe(r.get('CallType'), '') or '').lower()
+                    dur    = r.get('ConnectedDuration') or r.get('CallDuration')
+                    dur_s  = f"{int(dur)}s" if dur else ""
+                    disp   = _safe(r.get('CallDisposition'), '') or _safe(r.get('CallDispositionPicklist'), '')
+                    purpose= _safe(r.get('AICallPurpose'), '')
+                    outcome= _safe(r.get('AIOutcome'), '')
+                    summary= _safe(r.get('AISummary'), '')
+                    actions= _safe(r.get('AIActionItems'), '')
+                    notes  = _safe(r.get('CallDispositionNotes'), '') or _safe(r.get('Comments'), '')
+                    rec    = _safe(r.get('RecordingURL'), '')
+
+                    arrow = '→' if ctype == 'outbound' else ('←' if ctype == 'inbound' else '·')
+                    chips = []
+                    if ctype:    chips.append(f'<span class="chip chip-info">{_html.escape(ctype)}</span>')
+                    if dur_s:    chips.append(f'<span class="chip chip-mute">{dur_s}</span>')
+                    if disp:     chips.append(f'<span class="chip chip-info">{_html.escape(disp)}</span>')
+                    if outcome:  chips.append(f'<span class="chip chip-good">{_html.escape(outcome)}</span>')
+                    if rec:      chips.append(f'<a class="chip chip-mute" href="{_html.escape(rec)}" target="_blank">Recording</a>')
+
+                    body_parts = []
+                    if purpose: body_parts.append(f'<b>Purpose:</b> {_html.escape(purpose)}')
+                    if summary: body_parts.append(f'<b>AI summary:</b> {_html.escape(summary)[:600]}')
+                    if actions: body_parts.append(f'<b>Action items:</b> {_html.escape(actions)[:400]}')
+                    if notes:   body_parts.append(f'<b>Rep notes:</b> {_html.escape(notes)[:500]}')
+                    body_html = '<br>'.join(body_parts)
+
+                    rows_html.append(
+                        f'<div style="background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--blue);'
+                        f' border-radius:6px; padding:.55rem .8rem; margin-bottom:.4rem;">'
+                        f'<div style="display:flex; justify-content:space-between; align-items:baseline;">'
+                        f'<div style="font-family:var(--mono); font-size:.85rem; color:var(--ink);">{_html.escape(from_)} <span style="color:var(--muted);">{arrow}</span> {_html.escape(to_)}</div>'
+                        f'<div style="font-family:var(--mono); font-size:.7rem; color:var(--muted);">{_html.escape(when)}{(" &middot; " + _html.escape(agent)) if agent else ""}</div>'
+                        f'</div>'
+                        f'<div style="margin:.3rem 0;">{"".join(chips)}</div>'
+                        f'{("<div style=\"font-size:.88rem;\">" + body_html + "</div>") if body_html else ""}'
+                        f'</div>'
+                    )
+                st.html(''.join(rows_html))
+
+        with sub[2]:  # SMS — Dialpad text messages
+            sms_df = q("""
+            SELECT sl.CreatedDate, sl.ActivityDate, sl.AgentName,
+                   sl.CompanyNumber, sl.CustomerNumber, sl.Direction,
+                   sl.Body, sl.MessageStatus, sl.Subject,
+                   sl.ParentObjectId
+            FROM sms_logs sl
+            WHERE sl.ParentObjectId = ?
+               OR sl.ParentObjectId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
+               OR sl.ParentObjectId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
+               OR sl.RelatedObjectIds LIKE ?
+            ORDER BY sl.ActivityDate DESC NULLS LAST, sl.CreatedDate DESC
+            """, (aid, aid, aid, f'%{aid}%'))
+            st.caption(f":gray[{len(sms_df):,} text messages]")
+            if sms_df.empty:
+                st.markdown(":gray[No SMS logs tied to this clinic.]")
+            else:
+                import html as _html
+                rows_html = []
+                for _, r in sms_df.iterrows():
+                    when = str(_safe(r.get('ActivityDate'), '') or _safe(r.get('CreatedDate'), ''))[:16].replace('T',' ')
+                    agent = _safe(r.get('AgentName'), '')
+                    company = _safe(r.get('CompanyNumber'), '')
+                    customer= _safe(r.get('CustomerNumber'), '')
+                    direction = (_safe(r.get('Direction'), '') or '').lower()
+                    body = _safe(r.get('Body'), '') or _safe(r.get('Subject'), '')
+                    arrow = '→' if direction == 'outbound' else ('←' if direction == 'inbound' else '·')
+                    status = _safe(r.get('MessageStatus'), '')
+                    chips = []
+                    if direction: chips.append(f'<span class="chip chip-info">{_html.escape(direction)}</span>')
+                    if status:    chips.append(f'<span class="chip chip-mute">{_html.escape(status)}</span>')
+                    rows_html.append(
+                        f'<div style="background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--green);'
+                        f' border-radius:6px; padding:.5rem .8rem; margin-bottom:.4rem;">'
+                        f'<div style="display:flex; justify-content:space-between; align-items:baseline;">'
+                        f'<div style="font-family:var(--mono); font-size:.82rem;">{_html.escape(company)} <span style="color:var(--muted);">{arrow}</span> {_html.escape(customer)}</div>'
+                        f'<div style="font-family:var(--mono); font-size:.7rem; color:var(--muted);">{_html.escape(when)}{(" &middot; " + _html.escape(agent)) if agent else ""}</div>'
+                        f'</div>'
+                        f'<div style="margin:.25rem 0;">{"".join(chips)}</div>'
+                        f'<div style="white-space:pre-wrap; font-size:.9rem; color:var(--ink);">{_html.escape(body)[:1500]}</div>'
+                        f'</div>'
+                    )
+                st.html(''.join(rows_html))
+
+        with sub[3]:  # Emails
             try:
                 emails_df = q("""
                 SELECT le.Subject, le.Name AS CampaignName, le.Status,
@@ -1080,7 +1506,7 @@ def page_detail():
                     },
                 )
 
-        with sub[2]:  # Demos
+        with sub[4]:  # Demos
             try:
                 demos_df = q("""
                 SELECT ca.EventStartTime, ca.EventTypeName, ca.EventSubject,
@@ -1108,7 +1534,7 @@ def page_detail():
                     use_container_width=True, hide_index=True,
                 )
 
-        with sub[3]:  # Events
+        with sub[5]:  # Events
             df = q("""
             SELECT ActivityDate, Subject, StartDateTime, Description, OwnerId
             FROM events WHERE AccountId=? OR WhatId=?
@@ -1129,7 +1555,7 @@ def page_detail():
                     },
                 )
 
-        with sub[4]:  # Visits
+        with sub[6]:  # Visits
             wp_df = q("""
             SELECT w.Id, w.VisitDate, w.ArrivalTime, w.DepartureTime, w.Notes, w.CreatedDate,
                    u.Name AS Rep, r.Name AS Route,
@@ -1190,22 +1616,102 @@ def page_detail():
                     },
                 )
 
-        with sub[5]:  # Cases
-            df = q("SELECT CaseNumber, Subject, Status, Priority, CreatedDate, ClosedDate FROM cases WHERE AccountId=? ORDER BY CreatedDate DESC", (aid,))
+        with sub[7]:  # Cases
+            df = q("""
+            SELECT c.Id, c.CaseNumber, c.Subject, c.Status, c.Priority, c.Type,
+                   c.Reason, c.Origin, c.IsEscalated, c.STAT, c.Level_of_Urgency,
+                   c.Service_Type, c.Type_of_Scan, c.Patient_Name, c.Patient_Age,
+                   c.Immediate_Area_of_Concern, c.Notes_on_OPD, c.Description,
+                   c.Sonographer_Call_Back_Log_Priority,
+                   c.Requested_Call_Back_Time, c.X1st_Callback_Time, c.X1st_Callback_Completed_At,
+                   c.CreatedDate, c.ClosedDate, c.Time_Zone,
+                   c.First_Name, c.Last_Name, c.Job_Title, c.Email, c.Primary_Phone,
+                   ct.Name AS ContactName,
+                   asn.Name AS AssetName
+            FROM cases c
+            LEFT JOIN contacts ct ON ct.Id = c.ContactId
+            LEFT JOIN assets   asn ON asn.Id = c.AssetId
+            WHERE c.AccountId=?
+            ORDER BY c.STAT DESC, c.CreatedDate DESC
+            """, (aid,))
             st.caption(f":gray[{len(df):,} cases]")
-            if df.empty: st.markdown(":gray[—]")
+            if df.empty:
+                st.markdown(":gray[—]")
             else:
-                st.dataframe(
-                    df, use_container_width=True, hide_index=True,
-                    column_config={
-                        "CaseNumber":  st.column_config.TextColumn("Case #", width="small"),
-                        "Subject":     st.column_config.TextColumn(width="large"),
-                        "Status":      st.column_config.TextColumn(width="small"),
-                        "Priority":    st.column_config.TextColumn(width="small"),
-                        "CreatedDate": st.column_config.DateColumn("Opened", format="YYYY-MM-DD", width="small"),
-                        "ClosedDate":  st.column_config.DateColumn("Closed", format="YYYY-MM-DD", width="small"),
-                    },
-                )
+                # Render each case as a card so the clinical detail is readable
+                import html as _html
+                cards_html = []
+                for _, c in df.iterrows():
+                    case_no = _safe(c.get('CaseNumber'), '?')
+                    subj    = _safe(c.get('Subject'), '(no subject)')
+                    status  = _safe(c.get('Status'), '')
+                    prio    = _safe(c.get('Priority'), '')
+                    opened  = str(_safe(c.get('CreatedDate'), ''))[:10]
+                    closed  = str(_safe(c.get('ClosedDate'), ''))[:10]
+                    pat     = _safe(c.get('Patient_Name'), '')
+                    age     = _safe(c.get('Patient_Age'), '')
+                    scan    = _safe(c.get('Type_of_Scan'), '')
+                    urg     = _safe(c.get('Level_of_Urgency'), '')
+                    aoc     = _safe(c.get('Immediate_Area_of_Concern'), '')
+                    cb_prio = _safe(c.get('Sonographer_Call_Back_Log_Priority'), '')
+                    req_cb  = str(_safe(c.get('Requested_Call_Back_Time'), ''))[:16].replace('T',' ')
+                    cb1     = str(_safe(c.get('X1st_Callback_Time'), ''))[:16].replace('T',' ')
+                    cb1_done= str(_safe(c.get('X1st_Callback_Completed_At'), ''))[:16].replace('T',' ')
+                    contact = _safe(c.get('ContactName'), '') or f"{_safe(c.get('First_Name'),'')} {_safe(c.get('Last_Name'),'')}".strip()
+                    phone   = _safe(c.get('Primary_Phone'), '')
+                    email_  = _safe(c.get('Email'), '')
+                    asset_  = _safe(c.get('AssetName'), '')
+                    notes_  = _safe(c.get('Notes_on_OPD'), '')
+                    desc    = _safe(c.get('Description'), '')
+
+                    chips = []
+                    if c.get('STAT'):              chips.append('<span class="chip chip-bad">★ STAT</span>')
+                    if urg and urg.lower() in ('high','urgent','immediate'): chips.append(f'<span class="chip chip-warn">{_html.escape(urg)}</span>')
+                    elif urg:                      chips.append(f'<span class="chip chip-info">{_html.escape(urg)}</span>')
+                    if c.get('IsEscalated'):       chips.append('<span class="chip chip-warn">Escalated</span>')
+                    if prio:                       chips.append(f'<span class="chip chip-info">{_html.escape(prio)}</span>')
+                    if status:
+                        s_css = 'chip-good' if status.lower() == 'closed' else 'chip-info'
+                        chips.append(f'<span class="chip {s_css}">{_html.escape(status)}</span>')
+                    if cb_prio:                    chips.append(f'<span class="chip chip-info">Callback prio: {_html.escape(cb_prio)}</span>')
+
+                    # SLA timer for first callback
+                    sla = ''
+                    if req_cb and not cb1_done:
+                        sla = f'<span class="chip chip-warn">Callback pending (req {_html.escape(req_cb)})</span>'
+                    elif req_cb and cb1_done:
+                        sla = f'<span class="chip chip-good">Callback done {_html.escape(cb1_done)}</span>'
+                    if sla: chips.append(sla)
+
+                    detail_lines = []
+                    if pat or age: detail_lines.append(f'<b>Patient:</b> {_html.escape(pat)} {("(age " + _html.escape(str(age)) + ")") if age else ""}')
+                    if scan:       detail_lines.append(f'<b>Scan:</b> {_html.escape(scan)}')
+                    if aoc:        detail_lines.append(f'<b>Area of concern:</b> {_html.escape(aoc)}')
+                    if asset_:     detail_lines.append(f'<b>Asset:</b> {_html.escape(asset_)}')
+                    if contact:    detail_lines.append(f'<b>Contact:</b> {_html.escape(contact)}' + (f' &middot; {_html.escape(phone)}' if phone else '') + (f' &middot; <a href="mailto:{_html.escape(email_)}">{_html.escape(email_)}</a>' if email_ else ''))
+                    detail_html = '<br>'.join(detail_lines)
+
+                    desc_block = ''
+                    if desc:
+                        desc_block = f'<div style="margin-top:.5rem; white-space:pre-wrap; font-size:.9rem; color:var(--ink);">{_html.escape(desc[:2000])}</div>'
+                    notes_block = ''
+                    if notes_:
+                        notes_block = f'<div style="margin-top:.4rem; padding-top:.4rem; border-top:1px dashed var(--line);"><span style="font-family:var(--mono); font-size:.7rem; color:var(--muted);">OPD NOTES:</span><div style="white-space:pre-wrap; font-size:.9rem;">{_html.escape(notes_[:1500])}</div></div>'
+
+                    cards_html.append(
+                        f'<div style="background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--blue);'
+                        f' border-radius:6px; padding:.7rem .9rem; margin-bottom:.55rem;">'
+                        f'<div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap;">'
+                        f'<div style="font-weight:600; color:var(--blue); font-family:var(--serif); font-size:1.05rem;">{_html.escape(subj)}</div>'
+                        f'<div style="font-family:var(--mono); font-size:.7rem; color:var(--muted);">Case #{_html.escape(case_no)} &middot; opened {_html.escape(opened)}{(" &middot; closed " + _html.escape(closed)) if closed and closed != "None" else ""}</div>'
+                        f'</div>'
+                        f'<div style="margin:.35rem 0;">{"".join(chips)}</div>'
+                        f'{("<div style=\"font-size:.88rem; color:var(--ink); margin-top:.3rem;\">" + detail_html + "</div>") if detail_html else ""}'
+                        f'{desc_block}'
+                        f'{notes_block}'
+                        f'</div>'
+                    )
+                st.html(''.join(cards_html))
 
     # ─── Records ───
     with main_tabs[3]:
