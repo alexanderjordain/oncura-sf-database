@@ -30,8 +30,8 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v7.db")
-    MIN_BYTES = 940_000_000  # the v7 DB is ~958 MB; partials are unusable
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v8.db")
+    MIN_BYTES = 1_080_000_000  # the v8 DB is ~1.1 GB (full task descriptions restored)
     if os.path.exists(target) and os.path.getsize(target) >= MIN_BYTES:
         # Sanity check: can SQLite open it + does it have the expected columns?
         try:
@@ -47,7 +47,7 @@ def _resolve_db_path() -> str:
 
     import urllib.request, tempfile, shutil
     info = st.empty()
-    info.info("Loading the Salesforce snapshot database… (first launch only, ~960 MB — takes 1–2 min)")
+    info.info("Loading the Salesforce snapshot database… (first launch only, ~1.1 GB — takes 2–3 min)")
     tmp = target + ".tmp"
     try:
         with urllib.request.urlopen(DB_URL) as r, open(tmp, "wb") as out:
