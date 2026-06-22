@@ -452,27 +452,35 @@ def get_conn():
 
 @st.cache_data(ttl=3600)
 def q(sql, params=()):
-    # We use a direct sqlite3 cursor here (rather than letting pandas wrap
-    # the call) because pandas raises pandas.errors.DatabaseError without
-    # the underlying SQLite message; Streamlit Cloud then redacts the whole
-    # thing as a potential parameter leak. Running through sqlite3 ourselves
-    # surfaces "no such column: X" style errors that we can re-raise as a
-    # bare RuntimeError with the SQL fragment but no param values.
+    # Direct sqlite3 cursor avoids pandas's opaque DatabaseError wrapper.
+    # On failure we show the message inline via st.error() and return an
+    # empty DataFrame so the rest of the page can still render. Streamlit
+    # Cloud redacts exceptions in production, so st.error() with our own
+    # text is the only reliable way to surface diagnostics.
     try:
         cur = get_conn().execute(sql, params)
         cols = [d[0] for d in cur.description] if cur.description else []
         rows = cur.fetchall()
         return pd.DataFrame(rows, columns=cols)
     except sqlite3.OperationalError as e:
-        # Strip params from the SQL preview so Streamlit doesn't redact it.
-        preview = ' '.join(sql.split())[:200]
-        raise RuntimeError(f"SQL failed: {e}. Query: {preview}") from None
+        preview = ' '.join(sql.split())[:300]
+        st.error(f"Query failed — {e}\n\nSQL: `{preview}`")
+        return pd.DataFrame()
+    except sqlite3.DatabaseError as e:
+        preview = ' '.join(sql.split())[:300]
+        st.error(f"DB error — {e}\n\nSQL: `{preview}`")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def one(sql, params=()):
-    cur = get_conn().execute(sql, params)
-    row = cur.fetchone()
-    return dict(row) if row else None
+    try:
+        cur = get_conn().execute(sql, params)
+        row = cur.fetchone()
+        return dict(row) if row else None
+    except sqlite3.OperationalError as e:
+        preview = ' '.join(sql.split())[:300]
+        st.error(f"Query failed — {e}\n\nSQL: `{preview}`")
+        return None
 
 @st.cache_data(ttl=3600)
 def kpis():
