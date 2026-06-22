@@ -92,6 +92,14 @@ def _resolve_db_path() -> str:
 
 DB_PATH = _resolve_db_path()
 
+# Defensive: clear any stale @st.cache_resource / @st.cache_data values left
+# over from a previous deploy that pointed at an older DB path.
+try:
+    st.cache_resource.clear()
+    st.cache_data.clear()
+except Exception:
+    pass
+
 # Startup self-check — surface the actual deployed schema so we can tell
 # whether the v11 download is what we think it is. Renders once at the top
 # of every page if the contacts table is missing the expanded columns.
@@ -468,7 +476,12 @@ inject()
 sidebar_brand()
 
 # ───────────────────── DB ─────────────────────
-@st.cache_resource
+# Note: we deliberately do NOT @st.cache_resource get_conn(). Streamlit Cloud
+# persists @st.cache_resource values across deploys via internal soft-reload,
+# which means an old container's cached connection to a now-deleted DB path
+# (e.g. .oncura_sf_lookup_v9.db) would survive and the new DB_PATH would be
+# ignored. SQLite connection open is microseconds-cheap so a fresh connection
+# per call is fine and guarantees we always read the latest resolved file.
 def get_conn():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
