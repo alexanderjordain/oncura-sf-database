@@ -1103,7 +1103,10 @@ def page_detail():
         sub = st.tabs(["Opportunities", "Quotes", "Assets & Training"])
         with sub[0]:  # Opportunities
             df = q("""
-            SELECT Id, Name, Amount, StageName, IsWon, CloseDate, Type, LeadSource, OwnerId
+            SELECT Id, Name, Amount, StageName, IsWon, CloseDate, Type, LeadSource, OwnerId,
+                   Reason_Lost, Reason_Lost_Note, Sub_Type,
+                   Mindray_Shipped_Date, Demo_Completed_Date, Date_of_Rad_Set_Up,
+                   Funding_Source, Order_Placed_with_Terason
             FROM opportunities WHERE AccountId=?
             ORDER BY CloseDate DESC
             """, (aid,))
@@ -1119,10 +1122,15 @@ def page_detail():
                     return "Open"
                 df_disp = df.copy()
                 df_disp["Status"] = df_disp.apply(_stage_label, axis=1)
-                df_disp = df_disp[["Status", "CloseDate", "Name", "Amount", "StageName", "Type", "LeadSource", "Id"]]
+                # Reason_Lost only meaningful for Lost opps; surface inline
+                df_disp["Why Lost"] = df_disp.apply(
+                    lambda r: _safe(r.get("Reason_Lost"), "") if r.get("StageName","").lower().find("lost") >= 0 else "",
+                    axis=1,
+                )
+                df_disp = df_disp[["Status", "CloseDate", "Name", "Amount", "StageName", "Type", "Sub_Type", "LeadSource", "Why Lost", "Id"]]
                 df_disp = df_disp.rename(columns={
                     "Name": "Opportunity", "StageName": "Stage", "CloseDate": "Close Date",
-                    "LeadSource": "Source", "Id": "SF Opp ID"
+                    "LeadSource": "Source", "Sub_Type": "Sub-type", "Id": "SF Opp ID"
                 })
                 st.dataframe(
                     df_disp, use_container_width=True, hide_index=True,
@@ -1134,10 +1142,23 @@ def page_detail():
                         "Amount":      st.column_config.NumberColumn(format="$%d", width="small"),
                         "Stage":       st.column_config.TextColumn(width="small"),
                         "Type":        st.column_config.TextColumn(width="small"),
+                        "Sub-type":    st.column_config.TextColumn(width="small"),
                         "Source":      st.column_config.TextColumn(width="small"),
+                        "Why Lost":    st.column_config.TextColumn(width="medium", help="Reason_Lost field — only populated for closed-lost opps"),
                         "SF Opp ID":   st.column_config.TextColumn(width="small"),
                     },
                 )
+
+                # Lost-reason rollup — one-line summary of churn-reasons across this clinic's opps
+                lost = df[df["StageName"].fillna("").str.lower().str.contains("lost", na=False)]
+                if not lost.empty:
+                    reasons = lost["Reason_Lost"].dropna().astype(str)
+                    reasons = reasons[reasons.str.strip() != ""]
+                    if not reasons.empty:
+                        from collections import Counter
+                        counts = Counter(reasons.tolist())
+                        top = ", ".join(f"{r} ({n})" for r, n in counts.most_common(5))
+                        st.caption(f":gray[Lost-reason mix: {top}]")
 
                 with st.expander(":gray[Inspect stage history & description for one opportunity]"):
                     opp_choice = st.selectbox(
