@@ -1397,19 +1397,59 @@ def page_detail():
            )
         ORDER BY t.ActivityDate DESC NULLS LAST, t.CreatedDate DESC
         """, (aid, aid, aid, aid, aid, aid, aid, aid))
+        # Most call/email touchpoints were logged as Task records (Subject
+        # "Call", "Email: Re ...", etc.) rather than dedicated SF Call/Email
+        # objects — only 100 Dialpad call_logs and 0 dedicated email tasks
+        # exist, vs ~49k call-subject and ~57k email-subject tasks. Classify
+        # each Task by its Type+Subject so the type-filter chips work.
         for _, t in tasks_df.iterrows():
             d = _date_str(t.get("ActivityDate"))
             ttype = _safe(t.get("Type"), "")
             status = _safe(t.get("Status"), "")
             owner = _safe(t.get("OwnerName"), "")
+            subj = _safe(t.get("Subject"), "(no subject)")
+            subj_l = (subj or "").lower().lstrip()
+            ttype_l = ttype.lower()
+
+            if (ttype_l == "call"
+                or subj_l.startswith(("call", "phone", "vm ", "voicemail",
+                                     "returning vm", "left vm", "missed call",
+                                     "outbound", "inbound"))
+                or "dialpad" in subj_l):
+                kind = "Call"
+                color = "#2F567E"
+            elif (ttype_l == "email"
+                  or subj_l.startswith(("email", "re:", "fw:", "fwd:",
+                                       "sent email", "re ", "fw ", "fwd ",
+                                       "e-mail"))):
+                kind = "Email"
+                color = "#E3A033"
+            elif subj_l.startswith(("sms", "text:", "text message", "txt")):
+                kind = "SMS"
+                color = "#469B68"
+            elif subj_l.startswith(("visit", "in-person", "stopped by",
+                                    "drop in", "drop-in", "drop off",
+                                    "drop-off", "dropped off")):
+                kind = "Visit"
+                color = "#1B6E3A"
+            elif "demo" in subj_l or "training" in subj_l:
+                kind = "Demo"
+                color = "#7A2A86"
+            elif "meeting" in subj_l or "meet" in subj_l:
+                kind = "Event"
+                color = "#2F567E"
+            else:
+                kind = "Activity"
+                color = "#3A6A9A"
+
             meta_bits = [b for b in [ttype, status, owner] if b]
             timeline_items.append({
-                "kind": "Activity",
+                "kind": kind,
                 "when": d, "sort_key": _datetime_sort(t.get("ActivityDate")),
-                "title": _safe(t.get("Subject"), "(no subject)"),
+                "title": subj,
                 "meta": " · ".join(meta_bits),
                 "body": _safe(t.get("Description"), ""),
-                "color": "#3A6A9A",  # blue
+                "color": color,
             })
 
         # ─── Calls (Dialpad) ───
