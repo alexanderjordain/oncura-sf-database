@@ -30,8 +30,8 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v13.db")
-    EXPECTED_BYTES = 2_069_479_424  # v13 = Post-Migration merge (tasks 522k→987k, +AccountHistory 185k +ContactHistory 17k, full opp/lead schemas)
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v14.db")
+    EXPECTED_BYTES = 2_070_622_208  # v14 = v13 + 5,524 post-mig file_blobs metadata rows
     SIZE_TOLERANCE = 2 * 1024 * 1024  # allow ±2 MB to accommodate Content-Encoding variance
 
     # PRAGMA integrity_check scans the entire 1.25 GB DB and takes ~21 seconds
