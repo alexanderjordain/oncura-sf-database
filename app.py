@@ -30,8 +30,8 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v6.db")
-    MIN_BYTES = 940_000_000  # the v6 DB is ~958 MB; partials are unusable
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v7.db")
+    MIN_BYTES = 940_000_000  # the v7 DB is ~958 MB; partials are unusable
     if os.path.exists(target) and os.path.getsize(target) >= MIN_BYTES:
         # Sanity check: can SQLite open it + does it have the expected columns?
         try:
@@ -1335,19 +1335,45 @@ def page_detail():
     # Visits — Maps waypoints (in-person rep visits) plus the parent route
     with tabs[14]:
         wp_df = q("""
-        SELECT w.VisitDate, w.ArrivalTime, w.DepartureTime, w.Notes,
+        SELECT w.Id, w.VisitDate, w.ArrivalTime, w.DepartureTime, w.Notes, w.CreatedDate,
                u.Name AS Rep, r.Name AS Route,
                r.TravelDistance AS RouteMiles, r.TravelTime AS RouteMinutes
         FROM waypoints w
         LEFT JOIN users u ON u.Id = w.OwnerId
         LEFT JOIN maps_routes r ON r.Id = w.RouteId
         WHERE w.AccountId = ?
-        ORDER BY w.VisitDate DESC NULLS LAST, w.ArrivalTime DESC
+        ORDER BY w.VisitDate DESC NULLS LAST, w.ArrivalTime DESC, w.CreatedDate DESC
         """, (aid,))
         st.caption(f":gray[{len(wp_df):,} rep visits to this clinic (from Maps waypoints)]")
         if wp_df.empty:
             st.markdown(":gray[No logged in-person visits.]")
         else:
+            # Surface rep notes prominently before the visit table — these are
+            # rare (14 across the whole backup) but high-signal: KOL IDs,
+            # follow-up status, conversation summaries.
+            with_notes = wp_df[wp_df["Notes"].notna() & (wp_df["Notes"].astype(str).str.strip() != "")]
+            if not with_notes.empty:
+                st.markdown(":gray[**Rep visit notes**]")
+                for _, row in with_notes.iterrows():
+                    when = _safe(row.get("VisitDate"), "") or _safe(row.get("CreatedDate"), "")
+                    when = str(when)[:10] if when else "(no date)"
+                    rep = _safe(row.get("Rep"), "Unknown rep")
+                    route = _safe(row.get("Route"), "")
+                    meta = f"{when} &middot; {rep}"
+                    if route: meta += f" &middot; {route}"
+                    note_text = str(row.get("Notes")).strip()
+                    st.markdown(
+                        f"""<div style="border-left:3px solid var(--green); background:var(--surface);
+                              padding:.6rem .9rem; margin:.4rem 0; border-radius:4px;">
+                              <div style="font-family:var(--mono); font-size:.72rem;
+                                color:var(--muted); letter-spacing:.04em; text-transform:uppercase;
+                                margin-bottom:.3rem;">{meta}</div>
+                              <div style="color:var(--ink); font-size:.95rem; line-height:1.45;">{note_text}</div>
+                            </div>""",
+                        unsafe_allow_html=True,
+                    )
+                st.markdown("---")
+
             disp = wp_df.copy()
             disp["Visit"] = disp["VisitDate"].astype(str).str.slice(0,10)
             disp["Arrived"] = disp["ArrivalTime"].astype(str).str.slice(11,16)
