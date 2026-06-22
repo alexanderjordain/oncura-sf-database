@@ -30,27 +30,46 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v9.db")
-    MIN_BYTES = 1_160_000_000  # the v9 DB is ~1.2 GB (fixed ETL mappings + 5 new tables + 80+ restored columns)
-    if os.path.exists(target) and os.path.getsize(target) >= MIN_BYTES:
-        # Sanity check: can SQLite open it + does it have the expected columns?
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v10.db")
+    EXPECTED_BYTES = 1_250_562_048  # the v10 DB is 1.25 GB exact; partial downloads must be rejected
+    SIZE_TOLERANCE = 2 * 1024 * 1024  # allow ±2 MB to accommodate Content-Encoding variance
+
+    def _is_complete_valid(path):
+        if not os.path.exists(path): return False
+        size = os.path.getsize(path)
+        if abs(size - EXPECTED_BYTES) > SIZE_TOLERANCE: return False
+        # Schema-level validation — make sure every table the app reads from
+        # is intact. Partial downloads pass naive size checks but corrupt
+        # later pages, so we touch the schema of the most-recently-added tables.
         try:
             import sqlite3 as _sq
-            _c = _sq.connect(target)
+            _c = _sq.connect(path)
             _c.execute("SELECT AccountId FROM attachments LIMIT 1")
             _c.execute("SELECT 1 FROM maps_routes LIMIT 1")
             _c.execute("SELECT 1 FROM contact_monthly_metric LIMIT 1")
             _c.execute("SELECT Field FROM entity_history WHERE Field IS NOT NULL LIMIT 1")
-            _c.execute("SELECT Partner FROM accounts LIMIT 1")
+            _c.execute("SELECT Partner, Past_Due, Scan_Package FROM accounts LIMIT 1")
+            _c.execute("SELECT Department, MobilePhone, DoNotCall, pi_grade FROM contacts LIMIT 1")
+            _c.execute("SELECT STAT, Patient_Name, Type_of_Scan FROM cases LIMIT 1")
+            _c.execute("SELECT CallFrom, AISummary FROM call_logs LIMIT 1")
+            _c.execute("SELECT Body, Direction FROM sms_logs LIMIT 1")
+            _c.execute("SELECT CompanySignedDate, ActivatedDate FROM contracts LIMIT 1")
+            _c.execute("SELECT AssetPartNumber FROM assets LIMIT 1")
+            _c.execute("PRAGMA integrity_check")
             _c.close()
-            return target
+            return True
         except Exception:
-            try: os.remove(target)
-            except Exception: pass
+            return False
+
+    if _is_complete_valid(target):
+        return target
+    # Cached file is missing or corrupt — wipe and re-download.
+    try: os.remove(target)
+    except Exception: pass
 
     import urllib.request, tempfile, shutil
     info = st.empty()
-    info.info("Loading the Salesforce snapshot database… (first launch only, ~1.2 GB — takes 2–3 min)")
+    info.info("Loading the Salesforce snapshot database… (first launch only, ~1.25 GB — takes 2–3 min)")
     tmp = target + ".tmp"
     try:
         with urllib.request.urlopen(DB_URL) as r, open(tmp, "wb") as out:
@@ -58,9 +77,10 @@ def _resolve_db_path() -> str:
                 chunk = r.read(1 << 20)
                 if not chunk: break
                 out.write(chunk)
-        # Verify size before promoting to final path
-        if os.path.getsize(tmp) < MIN_BYTES:
-            raise RuntimeError(f"download incomplete: only {os.path.getsize(tmp):,} bytes")
+        # Strict size check: must match the published asset within tolerance
+        actual = os.path.getsize(tmp)
+        if abs(actual - EXPECTED_BYTES) > SIZE_TOLERANCE:
+            raise RuntimeError(f"download incomplete: got {actual:,} bytes, expected ~{EXPECTED_BYTES:,}")
         shutil.move(tmp, target)
     except Exception as e:
         try: os.remove(tmp)
