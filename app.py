@@ -1878,41 +1878,43 @@ def page_detail():
                 st.html(''.join(cards))
 
         with sub[1]:  # Chatter
-            # NewsFeed.csv has empty Title/Body for every row — the actual post
-            # content lives in feed_posts (FeedItem). NewsFeed rows are only
-            # informative when they carry a tracked-field-change detail in
-            # feed_tracked_change. Limit the NewsFeed branch of the UNION to
-            # those, otherwise we surface 50k+ "(no title)" rows.
+            # Expanded reach: chatter posts/tracked-changes can be attached
+            # not just to the account/contact/opportunity but also to any
+            # case, task, lead, asset, or contract that traces back to this
+            # clinic. The CTE materializes the full set of clinic-related
+            # SF Ids once; downstream branches just JOIN against it.
             chatter = q("""
+            WITH clinic_ids AS (
+                SELECT ? AS Id
+                UNION SELECT Id FROM contacts      WHERE AccountId=? AND IsDeleted=0
+                UNION SELECT Id FROM opportunities WHERE AccountId=?
+                UNION SELECT Id FROM cases         WHERE AccountId=?
+                UNION SELECT Id FROM tasks         WHERE AccountId=? OR WhatId=?
+                UNION SELECT Id FROM leads         WHERE ConvertedAccountId=?
+                UNION SELECT Id FROM assets        WHERE AccountId=? AND IsDeleted=0
+                UNION SELECT Id FROM contracts     WHERE AccountId=? AND IsDeleted=0
+            )
             SELECT 'Post' AS Kind, fp.Id, fp.Title AS Subj, fp.Body, fp.CreatedDate,
                    u.Name AS Author, NULL AS Field, NULL AS OldVal, NULL AS NewVal
-            FROM feed_posts fp LEFT JOIN users u ON u.Id = fp.InsertedById
-            WHERE fp.IsDeleted = 0 AND (
-                fp.ParentId = ?
-                OR fp.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-                OR fp.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-            )
+            FROM feed_posts fp
+            JOIN clinic_ids ci ON ci.Id = fp.ParentId
+            LEFT JOIN users u ON u.Id = fp.InsertedById
+            WHERE fp.IsDeleted = 0
             UNION ALL
-            SELECT 'Tracked change',
-                   nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name,
+            SELECT 'Tracked change', nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name,
                    ftc.FieldName, ftc.OldValue, ftc.NewValue
             FROM news_feed nf
-            LEFT JOIN users u ON u.Id = nf.InsertedById
+            JOIN clinic_ids ci ON ci.Id = nf.ParentId
             JOIN feed_tracked_change ftc ON ftc.FeedItemId = nf.Id
-            WHERE nf.Type = 'TrackedChange'
-              AND ftc.FieldName IS NOT NULL
-              AND (nf.ParentId = ?
-                   OR nf.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-                   OR nf.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?))
+            LEFT JOIN users u ON u.Id = nf.InsertedById
+            WHERE nf.Type = 'TrackedChange' AND ftc.FieldName IS NOT NULL
             UNION ALL
             SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name,
                    NULL, NULL, NULL
-            FROM feed_comments fc LEFT JOIN users u ON u.Id = fc.InsertedById
-            WHERE fc.IsDeleted = 0 AND (
-                fc.ParentId = ?
-                OR fc.ParentId IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-                OR fc.ParentId IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-            )
+            FROM feed_comments fc
+            JOIN clinic_ids ci ON ci.Id = fc.ParentId
+            LEFT JOIN users u ON u.Id = fc.InsertedById
+            WHERE fc.IsDeleted = 0
             ORDER BY CreatedDate DESC LIMIT 500
             """, (aid,)*9)
             if chatter is None or chatter.empty:
