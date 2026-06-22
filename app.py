@@ -2018,15 +2018,21 @@ def page_detail():
             # - Files on any Contact of this account
             # - Files on any Task tied to this account
             files_df = q("""
+            WITH clinic_ids AS (
+                SELECT ? AS Id
+                UNION SELECT Id FROM contacts      WHERE AccountId=? AND IsDeleted=0
+                UNION SELECT Id FROM opportunities WHERE AccountId=?
+                UNION SELECT Id FROM tasks         WHERE AccountId=? OR WhatId=?
+                UNION SELECT Id FROM cases         WHERE AccountId=?
+                UNION SELECT Id FROM contracts     WHERE AccountId=? AND IsDeleted=0
+                UNION SELECT Id FROM assets        WHERE AccountId=? AND IsDeleted=0
+            )
             SELECT fb.content_version_id, fb.parent_id, fb.parent_type,
                    fb.title, fb.extension, fb.size_bytes, fb.is_inline, fb.release_bucket
             FROM file_blobs fb
-            WHERE fb.parent_id = ?
-               OR fb.parent_id IN (SELECT Id FROM opportunities WHERE AccountId = ?)
-               OR fb.parent_id IN (SELECT Id FROM contacts WHERE AccountId = ? AND IsDeleted = 0)
-               OR fb.parent_id IN (SELECT Id FROM tasks WHERE AccountId = ? OR WhatId = ?)
+            JOIN clinic_ids ci ON ci.Id = fb.parent_id
             ORDER BY fb.is_inline DESC, fb.title COLLATE NOCASE
-            """, (aid, aid, aid, aid, aid))
+            """, (aid, aid, aid, aid, aid, aid, aid, aid))
             st.caption(f":gray[{len(files_df):,} files in the Salesforce backup]")
             # Two release-tag families now host the binaries:
             #   files-2026-03-25-{a..e}  — pre-migration ContentVersion files (4,297 rows,
@@ -2055,7 +2061,11 @@ def page_detail():
                     size_kb = (f.get("size_bytes") or 0) / 1024
                     size_str = f"{size_kb:,.0f} KB" if size_kb < 1024 else f"{size_kb/1024:,.1f} MB"
                     parent_type = f.get("parent_type") or ""
-                    parent_label = {"001": "Account", "003": "Contact", "006": "Opportunity", "00T": "Task", "002": "Note"}.get(parent_type, parent_type)
+                    parent_label = {
+                        "001": "Account", "003": "Contact", "006": "Opportunity",
+                        "00T": "Task", "002": "Note", "500": "Case",
+                        "800": "Contract", "02i": "Asset",
+                    }.get(parent_type, parent_type)
                     col_main, col_action = st.columns([5, 1])
                     col_main.markdown(f"**{title}.{ext}** · :gray[{size_str} · {parent_label}]")
                     col_action.link_button("Download", _build_file_url(bucket, cv_id, ext), use_container_width=True)
