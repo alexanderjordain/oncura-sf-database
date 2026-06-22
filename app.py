@@ -22,7 +22,7 @@ st.set_page_config(
 # ── Resolve the SQLite DB (downloaded from a GitHub Release on first run) ──
 DB_URL = os.environ.get(
     "ONCURA_DB_URL",
-    "https://github.com/alexanderjordain/oncura-sf-database/releases/download/snapshot-2026-03-25/oncura_sf_lookup_lite.db",
+    "https://github.com/alexanderjordain/oncura-sf-database/releases/download/snapshot-2026-06-22/oncura_sf_lookup_lite.db",
 )
 DB_LOCAL_OVERRIDE = os.environ.get("ONCURA_DB_PATH")
 
@@ -30,8 +30,8 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v12.db")
-    EXPECTED_BYTES = 1_289_449_472  # v12 = v11 + ANALYZE stats + perf indexes
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v13.db")
+    EXPECTED_BYTES = 2_069_479_424  # v13 = Post-Migration merge (tasks 522k→987k, +AccountHistory 185k +ContactHistory 17k, full opp/lead schemas)
     SIZE_TOLERANCE = 2 * 1024 * 1024  # allow ±2 MB to accommodate Content-Encoding variance
 
     # PRAGMA integrity_check scans the entire 1.25 GB DB and takes ~21 seconds
@@ -66,6 +66,11 @@ def _resolve_db_path() -> str:
             _c.execute("SELECT Body, Direction FROM sms_logs LIMIT 1")
             _c.execute("SELECT CompanySignedDate, ActivatedDate FROM contracts LIMIT 1")
             _c.execute("SELECT AssetPartNumber FROM assets LIMIT 1")
+            # v13 (Post-Migration merge) probes
+            _c.execute("SELECT CallDurationInSeconds FROM tasks LIMIT 1")
+            _c.execute("SELECT Reason_Lost FROM opportunities LIMIT 1")
+            _c.execute("SELECT Case_Duration FROM cases LIMIT 1")
+            _c.execute("SELECT ParentSobjectType FROM entity_history WHERE ParentSobjectType='Contact' LIMIT 1")
             # quick_check is ~50x cheaper than integrity_check and catches
             # all the corruption modes a truncated download would produce.
             qc = _c.execute("PRAGMA quick_check(1)").fetchone()
@@ -85,7 +90,7 @@ def _resolve_db_path() -> str:
 
     import urllib.request, tempfile, shutil
     info = st.empty()
-    info.info("Loading the Salesforce snapshot database… (first launch only, ~1.25 GB — takes 2–3 min)")
+    info.info("Loading the Salesforce snapshot database… (first launch only, ~2 GB — takes 3–4 min)")
     tmp = target + ".tmp"
     try:
         with urllib.request.urlopen(DB_URL) as r, open(tmp, "wb") as out:
@@ -130,7 +135,7 @@ def _self_check():
         cols = [r[1] for r in _c.execute("PRAGMA table_info(contacts)")]
         size_mb = os.path.getsize(DB_PATH) / 1024 / 1024
         _c.close()
-        missing = [c for c in ('Department','MobilePhone','DoNotCall','pi_grade','MailingState') if c not in cols]
+        missing = [c for c in ('Department','MobilePhone','DoNotCall','pi_grade','MailingState','Abdomen_M1') if c not in cols]
         if missing:
             st.warning(
                 f":material/warning: Stale snapshot detected at `{DB_PATH}` "
@@ -1382,7 +1387,9 @@ def page_detail():
         # ─── Tasks (Activities) ───
         tasks_df = q("""
         SELECT t.ActivityDate, t.Subject, t.Status, t.Type, t.OwnerId,
-               t.Description, t.Id, u.Name AS OwnerName
+               t.Description, t.Id, u.Name AS OwnerName,
+               t.CallDurationInSeconds, t.CallDisposition, t.CallType,
+               t.Dialpad_Call_Recording_URL
         FROM tasks t LEFT JOIN users u ON u.Id = t.OwnerId
         WHERE t.AccountId = ?
            OR t.WhatId    = ?
@@ -1411,7 +1418,16 @@ def page_detail():
             subj_l = (subj or "").lower().lstrip()
             ttype_l = ttype.lower()
 
+            # Dialpad-sourced tasks carry CallDurationInSeconds / CallType /
+            # Dialpad_Call_Recording_URL on the row itself.
+            call_dur  = t.get("CallDurationInSeconds")
+            call_type_native = (_safe(t.get("CallType"), "") or "").lower()
+            call_disp = _safe(t.get("CallDisposition"), "")
+            recording = _safe(t.get("Dialpad_Call_Recording_URL"), "")
+            has_call_signal = bool(call_dur or call_type_native or recording)
+
             if (ttype_l == "call"
+                or has_call_signal
                 or subj_l.startswith(("call", "phone", "vm ", "voicemail",
                                      "returning vm", "left vm", "missed call",
                                      "outbound", "inbound"))
@@ -1442,13 +1458,33 @@ def page_detail():
                 kind = "Activity"
                 color = "#3A6A9A"
 
+            # Enrich meta with Dialpad call details when present
             meta_bits = [b for b in [ttype, status, owner] if b]
+            if call_dur:
+                meta_bits.insert(0, f"{int(call_dur)}s")
+            if call_type_native:
+                arrow = "→ outbound" if call_type_native == "outbound" else ("← inbound" if call_type_native == "inbound" else call_type_native)
+                meta_bits.insert(0, arrow)
+            if call_disp:
+                meta_bits.append(call_disp)
+
+            body_val = _safe(t.get("Description"), "")
+            body_html_override = None
+            if recording:
+                # Render recording link as HTML so it stays clickable
+                import html as _h
+                body_html_override = (
+                    f'<a href="{_h.escape(recording)}" target="_blank" style="font-family:var(--mono); font-size:.8rem;">▶ Recording</a>'
+                    + (("<br>" + _h.escape(body_val)[:600]) if body_val else "")
+                )
+
             timeline_items.append({
                 "kind": kind,
                 "when": d, "sort_key": _datetime_sort(t.get("ActivityDate")),
                 "title": subj,
                 "meta": " · ".join(meta_bits),
-                "body": _safe(t.get("Description"), ""),
+                "body": body_val,
+                "body_html": body_html_override,
                 "color": color,
             })
 
