@@ -452,7 +452,21 @@ def get_conn():
 
 @st.cache_data(ttl=3600)
 def q(sql, params=()):
-    return pd.read_sql_query(sql, get_conn(), params=params)
+    # We use a direct sqlite3 cursor here (rather than letting pandas wrap
+    # the call) because pandas raises pandas.errors.DatabaseError without
+    # the underlying SQLite message; Streamlit Cloud then redacts the whole
+    # thing as a potential parameter leak. Running through sqlite3 ourselves
+    # surfaces "no such column: X" style errors that we can re-raise as a
+    # bare RuntimeError with the SQL fragment but no param values.
+    try:
+        cur = get_conn().execute(sql, params)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchall()
+        return pd.DataFrame(rows, columns=cols)
+    except sqlite3.OperationalError as e:
+        # Strip params from the SQL preview so Streamlit doesn't redact it.
+        preview = ' '.join(sql.split())[:200]
+        raise RuntimeError(f"SQL failed: {e}. Query: {preview}") from None
 
 @st.cache_data(ttl=3600)
 def one(sql, params=()):
