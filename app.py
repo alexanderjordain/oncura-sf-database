@@ -890,7 +890,9 @@ def page_detail():
                    No_longer_at_Company, Primary_Contact,
                    pi_grade, pi_score, pi_last_activity,
                    Certification, Cardiac_Certification,
-                   MailingCity, MailingState
+                   MailingCity, MailingState,
+                   Abdomen_M1, Abdomen_M2, Abdomen_M3, Abdominal_M4, Abdominal_M5,
+                   Cardiac_M1, Cardiac_M2, Cardiac_M5, Contact_Confirmed, Confirmed_Date
             FROM contacts WHERE AccountId=? AND IsDeleted=0
             ORDER BY LastName COLLATE NOCASE, FirstName COLLATE NOCASE
             """, (aid,))
@@ -914,6 +916,9 @@ def page_detail():
                     chip_html = []
                     if c.get('No_longer_at_Company'): chip_html.append('<span class="compliance-chip cc-noatcompany">No longer at co</span>')
                     if c.get('Primary_Contact'):     chip_html.append('<span class="compliance-chip cc-primary">PRIMARY</span>')
+                    if c.get('Contact_Confirmed'):
+                        cd = str(c.get('Confirmed_Date') or '')[:10]
+                        chip_html.append(f'<span class="compliance-chip cc-grade-A">✓ confirmed{(" " + cd) if cd else ""}</span>')
                     if c.get('DoNotCall'):           chip_html.append('<span class="compliance-chip cc-dnc">DO NOT CALL</span>')
                     if c.get('HasOptedOutOfEmail'): chip_html.append('<span class="compliance-chip cc-oo">opted-out email</span>')
                     if c.get('EmailBouncedDate'):   chip_html.append(f'<span class="compliance-chip cc-bounce">bounced</span>')
@@ -923,6 +928,26 @@ def page_detail():
                     if cert: chip_html.append(f'<span class="compliance-chip cc-grade-A">{_html.escape(cert)}</span>')
                     cardiac = _safe(c.get('Cardiac_Certification'), '')
                     if cardiac: chip_html.append(f'<span class="compliance-chip cc-grade-A">Cardiac: {_html.escape(cardiac)}</span>')
+
+                    # Training milestones — Abdomen M1-M5 and Cardiac M1-M5.
+                    # Each populated date = one filled dot, NULL = empty dot.
+                    abd_dates = [c.get('Abdomen_M1'), c.get('Abdomen_M2'), c.get('Abdomen_M3'),
+                                 c.get('Abdominal_M4'), c.get('Abdominal_M5')]
+                    car_dates = [c.get('Cardiac_M1'), c.get('Cardiac_M2'),
+                                 None, None, c.get('Cardiac_M5')]  # M3/M4 not exported
+                    def _milestone_dots(label, dates):
+                        filled = sum(1 for d in dates if d)
+                        if filled == 0: return None
+                        # Build a compact 5-dot indicator with tooltip = latest date
+                        latest = max((str(d) for d in dates if d), default='')[:10]
+                        dots = ''.join('●' if d else '○' for d in dates)
+                        return (f'<span class="compliance-chip" style="background:#E1ECF7; color:#2F567E;'
+                                f' font-family:var(--mono);" title="latest: {latest}">'
+                                f'{label} {dots} {filled}/{len([d for d in dates if d is not None or True])}</span>')
+                    abd_chip = _milestone_dots("ABD", abd_dates)
+                    car_chip = _milestone_dots("CARD", car_dates)
+                    if abd_chip: chip_html.append(abd_chip)
+                    if car_chip: chip_html.append(car_chip)
 
                     chip_row = ('<div style="margin-top:.25rem;">' + ''.join(chip_html) + '</div>') if chip_html else ''
 
@@ -2003,7 +2028,22 @@ def page_detail():
             ORDER BY fb.is_inline DESC, fb.title COLLATE NOCASE
             """, (aid, aid, aid, aid, aid))
             st.caption(f":gray[{len(files_df):,} files in the Salesforce backup]")
-            RELEASE_BASE = "https://github.com/alexanderjordain/oncura-sf-database/releases/download/files-2026-03-25-"
+            # Two release-tag families now host the binaries:
+            #   files-2026-03-25-{a..e}  — pre-migration ContentVersion files (4,297 rows,
+            #                              bucket column stores just 'a'-'e')
+            #   files-2026-06-22-{a..f}  — post-migration Attachment + ContentVersion files
+            #                              (5,524 rows, bucket column stores '2026-06-22-a' etc.)
+            BASE_PRE  = "https://github.com/alexanderjordain/oncura-sf-database/releases/download/files-2026-03-25-"
+            BASE_POST = "https://github.com/alexanderjordain/oncura-sf-database/releases/download/files-2026-06-22-"
+
+            def _build_file_url(bucket_value, cv_id, ext):
+                bv = str(bucket_value or 'a')
+                if bv.startswith('2026-06-22-'):
+                    # post-migration bucket value already encodes the date
+                    return f"{BASE_POST}{bv[-1]}/{cv_id}.{ext}"
+                # legacy single-letter bucket — pre-migration release
+                return f"{BASE_PRE}{bv}/{cv_id}.{ext}"
+
             if files_df.empty:
                 st.markdown(":gray[No files on this clinic in the backup.]")
             else:
@@ -2018,7 +2058,7 @@ def page_detail():
                     parent_label = {"001": "Account", "003": "Contact", "006": "Opportunity", "00T": "Task", "002": "Note"}.get(parent_type, parent_type)
                     col_main, col_action = st.columns([5, 1])
                     col_main.markdown(f"**{title}.{ext}** · :gray[{size_str} · {parent_label}]")
-                    col_action.link_button("Download", f"{RELEASE_BASE}{bucket}/{cv_id}.{ext}", use_container_width=True)
+                    col_action.link_button("Download", _build_file_url(bucket, cv_id, ext), use_container_width=True)
 
             # Legacy Salesforce Attachments (pre-Files architecture). Binary not in
             # the backup snapshot, but the metadata documents what existed.
