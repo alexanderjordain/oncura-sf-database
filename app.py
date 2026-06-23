@@ -30,8 +30,8 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v16.db")
-    EXPECTED_BYTES = 2_070_654_976  # v16 = v15 + hs_upgrade_status table (HubSpot live cross-check)
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v17.db")
+    EXPECTED_BYTES = 2_070_663_168  # v17 = v16 + hs_upgrade_status columns + 10 Samsung in-flight rows
     SIZE_TOLERANCE = 2 * 1024 * 1024  # allow ±2 MB to accommodate Content-Encoding variance
 
     # PRAGMA integrity_check scans the entire 1.25 GB DB and takes ~21 seconds
@@ -2362,7 +2362,10 @@ def page_sonixone():
              WHERE o.AccountId=a.Id AND o.IsWon=1) AS LifetimeWon,
            hs.hs_system AS HSSystem,
            hs.hs_install_date AS HSInstallDate,
-           hs.status AS HSStatus
+           hs.status AS HSStatus,
+           hs.hs_deal_id AS HSDealId,
+           hs.hs_deal_stage AS HSDealStage,
+           hs.hs_deal_product AS HSDealProduct
     FROM accounts a
     LEFT JOIN users u ON u.Id = a.OwnerId
     LEFT JOIN hs_upgrade_status hs ON hs.AccountId = a.Id
@@ -2377,11 +2380,13 @@ def page_sonixone():
     if df.empty:
         st.info(":gray[No SonixOne clinics found in the snapshot.]"); return
 
-    # Already-upgraded = clinic has both SonixOne AND another system on the SF
-    # asset side, OR HubSpot (live) shows a non-SonixOne system today.
+    # Already-upgraded covers two states we hide from the call list:
+    #   1. Installed: SF asset side OR HubSpot shows a non-SonixOne system today
+    #   2. In flight: open Samsung/Mindray deal at any pipeline stage
     df["AlreadyUpgraded"] = (
         (df["NonSonixUnits"].fillna(0) > 0)
         | (df["HSSystem"].notna() & (df["HSSystem"].astype(str).str.strip() != ""))
+        | (df["HSStatus"] == "in_flight")
     )
 
     def _years_installed(row):
@@ -2406,7 +2411,7 @@ def page_sonixone():
     total = len(df)
     upgrade_needed = int((~df["AlreadyUpgraded"]).sum())
     hs_installed = int((df["HSStatus"] == "installed").sum())
-    hs_in_flight = int((df["HSStatus"] == "in_flight_partner_stage").sum())
+    hs_in_flight = int((df["HSStatus"] == "in_flight").sum())
     still_partner = int(df["Partner"].fillna(0).astype(int).eq(1).sum())
     units = int(df["SonixUnits"].fillna(0).sum())
 
@@ -2416,7 +2421,7 @@ def page_sonixone():
         f'<span class="chip chip-info">Clinics: {total}</span>'
         f'<span class="chip chip-info">Need upgrade: {upgrade_needed}</span>'
         f'<span class="chip chip-good">Upgraded per HubSpot: {hs_installed}</span>'
-        f'<span class="chip chip-warn">Upgrade in flight (Samsung deal · Partner stage): {hs_in_flight}</span>'
+        f'<span class="chip chip-warn">Upgrade in flight (open Samsung/Mindray deal): {hs_in_flight}</span>'
         f'<span class="chip chip-info">Active partners: {still_partner}</span>'
         f'<span class="chip chip-mute">Total SonixOne units: {units}</span>'
         f'</div>', unsafe_allow_html=True,
@@ -2480,6 +2485,29 @@ def page_sonixone():
         file_name=f"sonixone_upgrade_list_{today.isoformat()}.csv",
         mime="text/csv",
     )
+
+    # In-flight deals — surface so reps don't try to re-sell what's being closed
+    in_flight_df = df[df["HSStatus"] == "in_flight"].copy()
+    if not in_flight_df.empty:
+        with st.expander(f":material/local_shipping: Upgrade in flight — {len(in_flight_df)} clinics with an open Samsung/Mindray deal", expanded=False):
+            st.caption(":gray[These are excluded from the call list above (Hide already-upgraded). The deal is live in HubSpot — don't double-contact unless coordinating with the deal owner.]")
+            disp_if = in_flight_df[["Clinic", "State", "Owner", "HSDealProduct", "HSDealStage", "HSDealId"]].rename(columns={
+                "HSDealProduct": "Product",
+                "HSDealStage":   "Pipeline stage",
+                "HSDealId":      "HubSpot deal id",
+            }).sort_values(by=["Pipeline stage", "Clinic"])
+            st.dataframe(
+                disp_if, use_container_width=True, hide_index=True,
+                height=min(440, 60 + 36*len(disp_if)),
+                column_config={
+                    "Clinic":          st.column_config.TextColumn(width="large"),
+                    "State":           st.column_config.TextColumn(width="small"),
+                    "Owner":           st.column_config.TextColumn(width="medium"),
+                    "Product":         st.column_config.TextColumn(width="medium"),
+                    "Pipeline stage":  st.column_config.TextColumn(width="medium"),
+                    "HubSpot deal id": st.column_config.TextColumn(width="small"),
+                },
+            )
 
     with st.expander(":gray[Open one clinic directly]"):
         if not f.empty:
