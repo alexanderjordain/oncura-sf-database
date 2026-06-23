@@ -1988,27 +1988,29 @@ def page_detail():
                 UNION SELECT Id FROM assets        WHERE AccountId=? AND IsDeleted=0
                 UNION SELECT Id FROM contracts     WHERE AccountId=? AND IsDeleted=0
             )
-            SELECT 'Post' AS Kind, fp.Id, fp.Title AS Subj, fp.Body, fp.CreatedDate,
-                   u.Name AS Author, NULL AS Field, NULL AS OldVal, NULL AS NewVal
-            FROM feed_posts fp
-            JOIN clinic_ids ci ON ci.Id = fp.ParentId
-            LEFT JOIN users u ON u.Id = fp.InsertedById
-            WHERE fp.IsDeleted = 0
-            UNION ALL
-            SELECT 'Tracked change', nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name,
-                   ftc.FieldName, ftc.OldValue, ftc.NewValue
-            FROM news_feed nf
-            JOIN clinic_ids ci ON ci.Id = nf.ParentId
-            JOIN feed_tracked_change ftc ON ftc.FeedItemId = nf.Id
-            LEFT JOIN users u ON u.Id = nf.InsertedById
-            WHERE nf.Type = 'TrackedChange' AND ftc.FieldName IS NOT NULL
-            UNION ALL
-            SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name,
-                   NULL, NULL, NULL
-            FROM feed_comments fc
-            JOIN clinic_ids ci ON ci.Id = fc.ParentId
-            LEFT JOIN users u ON u.Id = fc.InsertedById
-            WHERE fc.IsDeleted = 0
+            SELECT * FROM (
+                SELECT 'Post' AS Kind, fp.Id AS FeedId, fp.Title AS Subj, fp.Body, fp.CreatedDate AS CreatedDate,
+                       u.Name AS Author, NULL AS Field, NULL AS OldVal, NULL AS NewVal
+                FROM feed_posts fp
+                JOIN clinic_ids ci ON ci.Id = fp.ParentId
+                LEFT JOIN users u ON u.Id = fp.InsertedById
+                WHERE fp.IsDeleted = 0
+                UNION ALL
+                SELECT 'Tracked change', nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name,
+                       ftc.FieldName, ftc.OldValue, ftc.NewValue
+                FROM news_feed nf
+                JOIN clinic_ids ci ON ci.Id = nf.ParentId
+                JOIN feed_tracked_change ftc ON ftc.FeedItemId = nf.Id
+                LEFT JOIN users u ON u.Id = nf.InsertedById
+                WHERE nf.Type = 'TrackedChange' AND ftc.FieldName IS NOT NULL
+                UNION ALL
+                SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name,
+                       NULL, NULL, NULL
+                FROM feed_comments fc
+                JOIN clinic_ids ci ON ci.Id = fc.ParentId
+                LEFT JOIN users u ON u.Id = fc.InsertedById
+                WHERE fc.IsDeleted = 0
+            )
             ORDER BY CreatedDate DESC LIMIT 500
             """, (aid,)*9)
             if chatter is None or chatter.empty:
