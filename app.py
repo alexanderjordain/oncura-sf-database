@@ -30,8 +30,8 @@ def _resolve_db_path() -> str:
     if DB_LOCAL_OVERRIDE and os.path.exists(DB_LOCAL_OVERRIDE):
         return DB_LOCAL_OVERRIDE
     # Versioned filename so a schema change invalidates the cache automatically.
-    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v15.db")
-    EXPECTED_BYTES = 2_070_642_688  # v15 = v14 + 64 Account_Survey__c rows
+    target = os.path.join(os.path.expanduser("~"), ".oncura_sf_lookup_v16.db")
+    EXPECTED_BYTES = 2_070_654_976  # v16 = v15 + hs_upgrade_status table (HubSpot live cross-check)
     SIZE_TOLERANCE = 2 * 1024 * 1024  # allow ±2 MB to accommodate Content-Encoding variance
 
     # PRAGMA integrity_check scans the entire 1.25 GB DB and takes ~21 seconds
@@ -2359,9 +2359,13 @@ def page_sonixone():
              AND s2.Ultrasound_System IS NOT NULL AND s2.Ultrasound_System != ''
              AND s2.Ultrasound_System NOT LIKE '%SonixOne%') AS NonSonixUnits,
            (SELECT COALESCE(SUM(o.Amount),0) FROM opportunities o
-             WHERE o.AccountId=a.Id AND o.IsWon=1) AS LifetimeWon
+             WHERE o.AccountId=a.Id AND o.IsWon=1) AS LifetimeWon,
+           hs.hs_system AS HSSystem,
+           hs.hs_install_date AS HSInstallDate,
+           hs.status AS HSStatus
     FROM accounts a
     LEFT JOIN users u ON u.Id = a.OwnerId
+    LEFT JOIN hs_upgrade_status hs ON hs.AccountId = a.Id
     WHERE a.IsDeleted=0
       AND (a.Ultrasound_System LIKE '%SonixOne%'
            OR a.Id IN (SELECT AccountId FROM assets s
@@ -2373,8 +2377,12 @@ def page_sonixone():
     if df.empty:
         st.info(":gray[No SonixOne clinics found in the snapshot.]"); return
 
-    # Already-upgraded = clinic has both SonixOne AND another system on file
-    df["AlreadyUpgraded"] = df["NonSonixUnits"].fillna(0) > 0
+    # Already-upgraded = clinic has both SonixOne AND another system on the SF
+    # asset side, OR HubSpot (live) shows a non-SonixOne system today.
+    df["AlreadyUpgraded"] = (
+        (df["NonSonixUnits"].fillna(0) > 0)
+        | (df["HSSystem"].notna() & (df["HSSystem"].astype(str).str.strip() != ""))
+    )
 
     def _years_installed(row):
         for col in ("EarliestSonixInstall", "PrimaryInstall"):
@@ -2397,6 +2405,8 @@ def page_sonixone():
     # Header KPI strip
     total = len(df)
     upgrade_needed = int((~df["AlreadyUpgraded"]).sum())
+    hs_installed = int((df["HSStatus"] == "installed").sum())
+    hs_in_flight = int((df["HSStatus"] == "in_flight_partner_stage").sum())
     still_partner = int(df["Partner"].fillna(0).astype(int).eq(1).sum())
     units = int(df["SonixUnits"].fillna(0).sum())
 
@@ -2405,7 +2415,8 @@ def page_sonixone():
         f'<div class="chip-row">'
         f'<span class="chip chip-info">Clinics: {total}</span>'
         f'<span class="chip chip-info">Need upgrade: {upgrade_needed}</span>'
-        f'<span class="chip chip-good">Already upgraded: {total - upgrade_needed}</span>'
+        f'<span class="chip chip-good">Upgraded per HubSpot: {hs_installed}</span>'
+        f'<span class="chip chip-warn">Upgrade in flight (Samsung deal · Partner stage): {hs_in_flight}</span>'
         f'<span class="chip chip-info">Active partners: {still_partner}</span>'
         f'<span class="chip chip-mute">Total SonixOne units: {units}</span>'
         f'</div>', unsafe_allow_html=True,
