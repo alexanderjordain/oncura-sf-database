@@ -621,7 +621,7 @@ def _num(v, fallback=None):
         return fallback
 
 # ───────────────────── sidebar nav ─────────────────────
-PAGES = ["Clinic search", "Clinic detail", "Sales activity", "Renewal radar"]
+PAGES = ["Clinic search", "Clinic detail", "Sales activity", "Renewal radar", "SonixOne upgrades"]
 page = render_sidebar_nav(PAGES)
 
 # ───────────────────── PAGE: Search ─────────────────────
@@ -2288,8 +2288,180 @@ def page_renewal():
         )
     st.html(''.join(rows_html))
 
+# ───────────────────── PAGE: SonixOne upgrade radar ─────────────────────
+def page_sonixone():
+    header(
+        "SonixOne upgrade radar",
+        "Clinics still running SonixOne — Oncura ends servicing on Oct 1, 2026."
+    )
+
+    import datetime as _dt
+    today = _dt.date(2026, 6, 23)
+    deadline = _dt.date(2026, 10, 1)
+    days_left = (deadline - today).days
+
+    # Pull every account flagged as SonixOne, plus every SonixOne asset
+    # so we can show serial counts + most-recent install per clinic.
+    df = q("""
+    SELECT a.Id, a.Name AS Clinic,
+           a.BillingState AS State, a.BillingCity AS City,
+           a.Phone, a.Hospital_ID, a.Partner, a.Past_Due,
+           a.Ultrasound_System AS PrimarySystem,
+           a.US_Install_Date AS PrimaryInstall,
+           a.Most_Recent_Install_Date AS RecentInstall,
+           a.OwnerId, a.Regional_Clinical_Specialist AS RCS,
+           a.Territory, a.Last_OSR_Call_Visit AS LastOSRVisit,
+           u.Name AS Owner,
+           (SELECT COUNT(*) FROM assets s
+             WHERE s.AccountId=a.Id AND s.IsDeleted=0
+               AND s.Ultrasound_System LIKE '%SonixOne%') AS SonixUnits,
+           (SELECT GROUP_CONCAT(COALESCE(s.SerialNumber, s.AssetSerialNumber), ', ')
+              FROM assets s WHERE s.AccountId=a.Id AND s.IsDeleted=0
+                AND s.Ultrasound_System LIKE '%SonixOne%') AS Serials,
+           (SELECT MIN(s.InstallDate) FROM assets s
+             WHERE s.AccountId=a.Id AND s.IsDeleted=0
+               AND s.Ultrasound_System LIKE '%SonixOne%') AS EarliestSonixInstall,
+           (SELECT MAX(s.InstallDate) FROM assets s
+             WHERE s.AccountId=a.Id AND s.IsDeleted=0
+               AND s.Ultrasound_System LIKE '%SonixOne%') AS LatestSonixInstall,
+           (SELECT COUNT(*) FROM assets s2 WHERE s2.AccountId=a.Id AND s2.IsDeleted=0
+             AND s2.Ultrasound_System IS NOT NULL AND s2.Ultrasound_System != ''
+             AND s2.Ultrasound_System NOT LIKE '%SonixOne%') AS NonSonixUnits,
+           (SELECT COALESCE(SUM(o.Amount),0) FROM opportunities o
+             WHERE o.AccountId=a.Id AND o.IsWon=1) AS LifetimeWon
+    FROM accounts a
+    LEFT JOIN users u ON u.Id = a.OwnerId
+    WHERE a.IsDeleted=0
+      AND (a.Ultrasound_System LIKE '%SonixOne%'
+           OR a.Id IN (SELECT AccountId FROM assets s
+                       WHERE s.IsDeleted=0
+                         AND s.Ultrasound_System LIKE '%SonixOne%'))
+    ORDER BY a.Name COLLATE NOCASE
+    """)
+
+    if df.empty:
+        st.info(":gray[No SonixOne clinics found in the snapshot.]"); return
+
+    # Already-upgraded = clinic has both SonixOne AND another system on file
+    df["AlreadyUpgraded"] = df["NonSonixUnits"].fillna(0) > 0
+    df["YearsInstalled"] = df.apply(
+        lambda r: (round((_dt.date(2026,6,23) - _dt.date.fromisoformat(str(r.get("EarliestSonixInstall") or r.get("PrimaryInstall") or "1900-01-01")[:10])).days/365.25, 1)
+                   if (r.get("EarliestSonixInstall") or r.get("PrimaryInstall")) else None),
+        axis=1,
+    )
+
+    # Header KPI strip
+    total = len(df)
+    upgrade_needed = int((~df["AlreadyUpgraded"]).sum())
+    still_partner = int(df["Partner"].fillna(0).astype(int).eq(1).sum())
+    past_due = int(df["Past_Due"].fillna(0).astype(int).eq(1).sum())
+    units = int(df["SonixUnits"].fillna(0).sum())
+
+    import html as _html
+    deadline_color = "chip-bad" if days_left < 90 else ("chip-warn" if days_left < 180 else "chip-info")
+    st.markdown(
+        f'<div class="chip-row">'
+        f'<span class="chip {deadline_color}">⚠ End-of-service {deadline.isoformat()} &middot; {days_left} days left</span>'
+        f'<span class="chip chip-info">Clinics: {total}</span>'
+        f'<span class="chip chip-bad">Need upgrade: {upgrade_needed}</span>'
+        f'<span class="chip chip-good">Already upgraded: {total - upgrade_needed}</span>'
+        f'<span class="chip chip-info">Active partners: {still_partner}</span>'
+        f'<span class="chip chip-warn">Past-due partners: {past_due}</span>'
+        f'<span class="chip chip-mute">Total SonixOne units: {units}</span>'
+        f'</div>', unsafe_allow_html=True,
+    )
+
+    # Filters
+    c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.2, 1.2])
+    state_opts = sorted([s for s in df["State"].dropna().unique() if s])
+    state_pick = c1.multiselect("State", state_opts, placeholder="All states")
+    owner_opts = sorted([o for o in df["Owner"].dropna().unique() if o])
+    owner_pick = c2.multiselect("Owner (PS rep)", owner_opts, placeholder="All owners")
+    partner_only = c3.checkbox("Active partners only", value=True)
+    hide_upgraded = c4.checkbox("Hide already-upgraded", value=True)
+
+    f = df.copy()
+    if state_pick: f = f[f["State"].isin(state_pick)]
+    if owner_pick: f = f[f["Owner"].isin(owner_pick)]
+    if partner_only: f = f[f["Partner"].fillna(0).astype(int).eq(1)]
+    if hide_upgraded: f = f[~f["AlreadyUpgraded"]]
+
+    # Sort: past-due first, then years-installed desc (oldest installs = most urgent)
+    f = f.sort_values(
+        by=["Past_Due", "YearsInstalled", "LifetimeWon"],
+        ascending=[False, False, False],
+        na_position="last",
+    )
+
+    st.caption(f":gray[{len(f):,} clinics meeting filters — sorted past-due first, then by install age.]")
+
+    # Render as a table
+    disp = f.copy()
+    disp["⚠"] = disp.apply(
+        lambda r: "★ Past Due" if r.get("Past_Due") == 1 else
+                  ("✓ Upgraded" if r.get("AlreadyUpgraded") else ""),
+        axis=1,
+    )
+    disp["LifetimeWon$"] = disp["LifetimeWon"].fillna(0).astype(float)
+    disp_cols = ["⚠", "Clinic", "State", "City", "Owner", "RCS", "Territory",
+                 "SonixUnits", "YearsInstalled", "EarliestSonixInstall", "LatestSonixInstall",
+                 "LastOSRVisit", "LifetimeWon$", "Phone", "Hospital_ID", "Id"]
+    disp = disp[disp_cols].rename(columns={
+        "SonixUnits": "Units",
+        "YearsInstalled": "Yrs old",
+        "EarliestSonixInstall": "1st install",
+        "LatestSonixInstall": "Last install",
+        "LastOSRVisit": "Last OSR visit",
+        "Hospital_ID": "Hospital ID",
+        "Id": "SF Account ID",
+    })
+    st.dataframe(
+        disp, use_container_width=True, hide_index=True,
+        height=min(640, 60 + 36*len(disp)),
+        column_config={
+            "⚠":             st.column_config.TextColumn(width="small"),
+            "Clinic":        st.column_config.TextColumn(width="large"),
+            "State":         st.column_config.TextColumn(width="small"),
+            "City":          st.column_config.TextColumn(width="small"),
+            "Owner":         st.column_config.TextColumn(width="medium"),
+            "RCS":           st.column_config.TextColumn(width="medium"),
+            "Territory":     st.column_config.TextColumn(width="small"),
+            "Units":         st.column_config.NumberColumn(width="small"),
+            "Yrs old":       st.column_config.NumberColumn(format="%.1f", width="small"),
+            "1st install":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+            "Last install":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+            "Last OSR visit":st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+            "LifetimeWon$":  st.column_config.NumberColumn(format="$%d", width="small"),
+            "Phone":         st.column_config.TextColumn(width="small"),
+            "Hospital ID":   st.column_config.TextColumn(width="small"),
+            "SF Account ID": st.column_config.TextColumn(width="small"),
+        },
+    )
+
+    # CSV download
+    csv_bytes = f.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download list as CSV",
+        data=csv_bytes,
+        file_name=f"sonixone_upgrade_list_{today.isoformat()}.csv",
+        mime="text/csv",
+    )
+
+    with st.expander(":gray[Open one clinic directly]"):
+        if not f.empty:
+            choice = st.selectbox(
+                "Clinic",
+                ["—"] + [f"{r['Clinic']} [{r['Id']}]" for _, r in f.iterrows()],
+                label_visibility="collapsed",
+            )
+            if choice != "—":
+                cid = choice.split("[")[-1].rstrip("]")
+                st.markdown(f'[:material/arrow_forward: Open clinic detail page](?clinic={cid})')
+
+
 # ───────────────────── Router ─────────────────────
 if   page == "Clinic search":   page_search()
 elif page == "Clinic detail":   page_detail()
 elif page == "Sales activity":  page_activity()
 elif page == "Renewal radar":   page_renewal()
+elif page == "SonixOne upgrades": page_sonixone()
