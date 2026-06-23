@@ -621,7 +621,7 @@ def _num(v, fallback=None):
         return fallback
 
 # ───────────────────── sidebar nav ─────────────────────
-PAGES = ["Clinic search", "Clinic detail", "Sales activity", "Renewal radar", "SonixOne upgrades"]
+PAGES = ["Clinic search", "Clinic detail", "Sales activity", "SonixOne upgrades"]
 page = render_sidebar_nav(PAGES)
 
 # ───────────────────── PAGE: Search ─────────────────────
@@ -2225,69 +2225,6 @@ def page_activity():
         )
     st.html(''.join(rows_html))
 
-# ───────────────────── PAGE: Renewal radar ─────────────────────
-def page_renewal():
-    header("Renewal radar", "Partner clinics ranked by install age. Use it to spot upgrade candidates.")
-
-    df = q("""
-    SELECT Id, Name AS Clinic, BillingState AS State, BillingCity AS City,
-           US_Install_Date AS Installed, Ultrasound_System AS System,
-           Phone, Hospital_ID,
-           (SELECT COALESCE(SUM(Amount),0) FROM opportunities o WHERE o.AccountId=accounts.Id AND o.IsWon=1) AS WonTotal
-    FROM accounts
-    WHERE IsDeleted=0 AND Partner=1 AND Installed IS NOT NULL AND Installed != ''
-    ORDER BY Installed
-    """)
-    if df.empty:
-        st.info(":material/info: No partner install data available in the snapshot."); return
-    df["YearsSinceInstall"] = ((datetime.now() - pd.to_datetime(df["Installed"], errors="coerce")).dt.days / 365.25).round(1)
-
-    c1, c2 = st.columns(2)
-    min_years = c1.slider("Minimum years since install", 0.0, 12.0, 4.0, 0.5)
-    system_filter = c2.multiselect("Ultrasound system", sorted(df["System"].dropna().unique().tolist()))
-    f = df[df["YearsSinceInstall"] >= min_years]
-    if system_filter:
-        f = f[f["System"].isin(system_filter)]
-    st.caption(f":gray[{len(f):,} partner clinics meeting filters · showing top 100]")
-    import html as _html
-    rows_html = []
-    for _, r in f.head(100).iterrows():
-        cid = _safe(r["Id"])
-        cname = _safe(r["Clinic"], "(no name)")
-        state = _safe(r["State"])
-        city  = _safe(r["City"])
-        installed = _safe(r["Installed"])
-        try:    years = float(r["YearsSinceInstall"])
-        except: years = 0.0
-        system = _safe(r["System"])
-        try:    won_n = float(r["WonTotal"] or 0)
-        except: won_n = 0.0
-        phone = _safe(r["Phone"])
-        hid = _safe(r["Hospital_ID"])
-        secondary_parts = []
-        if hid: secondary_parts.append(f'<code>{_html.escape(hid)}</code>')
-        loc_bits = [_html.escape(p) for p in [city, state] if p]
-        if loc_bits: secondary_parts.append(' &middot; '.join(loc_bits))
-        if phone: secondary_parts.append(_html.escape(phone))
-        if installed: secondary_parts.append(f'Installed {_html.escape(installed)}')
-        if system: secondary_parts.append(_html.escape(system))
-        secondary = '<span class="sep">·</span>'.join(secondary_parts) or '—'
-        rows_html.append(
-            f'<a class="result-row" href="?clinic={_html.escape(cid)}" target="_self">'
-            f'<div>'
-            f'<div class="name-row">'
-            f'<span class="clinic-link">{_html.escape(cname)}</span>'
-            f'</div>'
-            f'<div class="secondary">{secondary}</div>'
-            f'</div>'
-            f'<div class="stats">'
-            f'<div class="stat">Years since<span class="v">{years:.1f}</span></div>'
-            f'<div class="stat">Closed-Won<span class="v">${won_n:,.0f}</span></div>'
-            f'</div>'
-            f'</a>'
-        )
-    st.html(''.join(rows_html))
-
 # ───────────────────── PAGE: SonixOne upgrade radar ─────────────────────
 def page_sonixone():
     header(
@@ -2408,50 +2345,36 @@ def page_sonixone():
 
     st.caption(f":gray[{len(f):,} clinics meeting filters — sorted past-due first, then by install age.]")
 
-    # Render as a table
+    # Render as a tight, call-list-ready table — required fields only.
+    # Reps need: status flag, clinic name, location, who owns it, urgency
+    # signal (years on platform), original install date, and phone to dial.
     disp = f.copy()
     disp["⚠"] = disp.apply(
         lambda r: "★ Past Due" if r.get("Past_Due") == 1 else
                   ("✓ Upgraded" if r.get("AlreadyUpgraded") else ""),
         axis=1,
     )
-    disp["LifetimeWon$"] = disp["LifetimeWon"].fillna(0).astype(float)
-    disp_cols = ["⚠", "Clinic", "State", "City", "Owner", "RCS", "Territory",
-                 "SonixUnits", "YearsInstalled", "EarliestSonixInstall", "LatestSonixInstall",
-                 "LastOSRVisit", "LifetimeWon$", "Phone", "Hospital_ID", "Id"]
+    disp_cols = ["⚠", "Clinic", "State", "Owner", "YearsInstalled",
+                 "EarliestSonixInstall", "Phone"]
     disp = disp[disp_cols].rename(columns={
-        "SonixUnits": "Units",
-        "YearsInstalled": "Yrs old",
-        "EarliestSonixInstall": "1st install",
-        "LatestSonixInstall": "Last install",
-        "LastOSRVisit": "Last OSR visit",
-        "Hospital_ID": "Hospital ID",
-        "Id": "SF Account ID",
+        "YearsInstalled":       "Yrs old",
+        "EarliestSonixInstall": "Install date",
     })
     st.dataframe(
         disp, use_container_width=True, hide_index=True,
         height=min(640, 60 + 36*len(disp)),
         column_config={
-            "⚠":             st.column_config.TextColumn(width="small"),
-            "Clinic":        st.column_config.TextColumn(width="large"),
-            "State":         st.column_config.TextColumn(width="small"),
-            "City":          st.column_config.TextColumn(width="small"),
-            "Owner":         st.column_config.TextColumn(width="medium"),
-            "RCS":           st.column_config.TextColumn(width="medium"),
-            "Territory":     st.column_config.TextColumn(width="small"),
-            "Units":         st.column_config.NumberColumn(width="small"),
-            "Yrs old":       st.column_config.NumberColumn(format="%.1f", width="small"),
-            "1st install":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-            "Last install":  st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-            "Last OSR visit":st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-            "LifetimeWon$":  st.column_config.NumberColumn(format="$%d", width="small"),
-            "Phone":         st.column_config.TextColumn(width="small"),
-            "Hospital ID":   st.column_config.TextColumn(width="small"),
-            "SF Account ID": st.column_config.TextColumn(width="small"),
+            "⚠":            st.column_config.TextColumn(width="small"),
+            "Clinic":       st.column_config.TextColumn(width="large"),
+            "State":        st.column_config.TextColumn(width="small"),
+            "Owner":        st.column_config.TextColumn("PS Rep", width="medium"),
+            "Yrs old":      st.column_config.NumberColumn(format="%.1f", width="small"),
+            "Install date": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+            "Phone":        st.column_config.TextColumn(width="medium"),
         },
     )
 
-    # CSV download
+    # CSV download — full data set (every column), not the trimmed table
     csv_bytes = f.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download list as CSV",
@@ -2476,5 +2399,4 @@ def page_sonixone():
 if   page == "Clinic search":   page_search()
 elif page == "Clinic detail":   page_detail()
 elif page == "Sales activity":  page_activity()
-elif page == "Renewal radar":   page_renewal()
 elif page == "SonixOne upgrades": page_sonixone()
