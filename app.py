@@ -608,6 +608,18 @@ def _safe(v, fallback=""):
         pass
     return v if isinstance(v, str) else str(v)
 
+def _num(v, fallback=None):
+    """Coerce a value to float, returning fallback for None/NaN/non-numeric.
+    Use to guard int() casts on pandas-returned numeric columns where NULL
+    becomes float NaN (bool-truthy but int()-fatal)."""
+    try:
+        if v is None: return fallback
+        import pandas as _pd
+        if _pd.isna(v): return fallback
+        return float(v)
+    except (TypeError, ValueError):
+        return fallback
+
 # ───────────────────── sidebar nav ─────────────────────
 PAGES = ["Clinic search", "Clinic detail", "Sales activity", "Renewal radar"]
 page = render_sidebar_nav(PAGES)
@@ -1466,11 +1478,11 @@ def page_detail():
 
             # Dialpad-sourced tasks carry CallDurationInSeconds / CallType /
             # Dialpad_Call_Recording_URL on the row itself.
-            call_dur  = t.get("CallDurationInSeconds")
+            call_dur  = _num(t.get("CallDurationInSeconds"))   # None if NULL/NaN
             call_type_native = (_safe(t.get("CallType"), "") or "").lower()
             call_disp = _safe(t.get("CallDisposition"), "")
             recording = _safe(t.get("Dialpad_Call_Recording_URL"), "")
-            has_call_signal = bool(call_dur or call_type_native or recording)
+            has_call_signal = bool((call_dur and call_dur > 0) or call_type_native or recording)
 
             if (ttype_l == "call"
                 or has_call_signal
@@ -1506,7 +1518,7 @@ def page_detail():
 
             # Enrich meta with Dialpad call details when present
             meta_bits = [b for b in [ttype, status, owner] if b]
-            if call_dur:
+            if call_dur and call_dur > 0:
                 meta_bits.insert(0, f"{int(call_dur)}s")
             if call_type_native:
                 arrow = "→ outbound" if call_type_native == "outbound" else ("← inbound" if call_type_native == "inbound" else call_type_native)
@@ -1554,8 +1566,8 @@ def page_detail():
             arrow = "→" if ctype == "outbound" else ("←" if ctype == "inbound" else "·")
             from_ = _safe(r.get("CallFrom"), "")
             to_   = _safe(r.get("CallTo"), "")
-            dur   = r.get("ConnectedDuration") or r.get("CallDuration")
-            dur_s = f"{int(dur)}s" if dur else ""
+            dur   = _num(r.get("ConnectedDuration")) or _num(r.get("CallDuration"))
+            dur_s = f"{int(dur)}s" if dur and dur > 0 else ""
             disp  = _safe(r.get("CallDisposition"), "")
             purpose = _safe(r.get("AICallPurpose"), "")
             outcome = _safe(r.get("AIOutcome"), "")
@@ -1720,8 +1732,8 @@ def page_detail():
             when_raw = r.get("ActivityDate")
             etype = _safe(r.get("Type"), "")
             loc = _safe(r.get("Location"), "")
-            dur = r.get("DurationInMinutes")
-            dur_s = f"{int(dur)}m" if dur else ""
+            dur = _num(r.get("DurationInMinutes"))
+            dur_s = f"{int(dur)}m" if dur and dur > 0 else ""
             rep = _safe(r.get("Sales_Rep"), "") or owner_map.get(_safe(r.get("OwnerId"),""), "")
             chips = []
             if r.get("Calendly_IsNoShow"):     chips.append("NO-SHOW")
