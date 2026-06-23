@@ -2422,7 +2422,7 @@ def page_sonixone():
     state_opts = sorted([s for s in df["State"].dropna().unique() if s])
     state_pick = c1.multiselect("State", state_opts, placeholder="All states")
     owner_opts = sorted([o for o in df["Owner"].dropna().unique() if o])
-    owner_pick = c2.multiselect("Owner (PS rep)", owner_opts, placeholder="All owners")
+    owner_pick = c2.multiselect("Owner", owner_opts, placeholder="All owners")
     partner_only = c3.checkbox("Active partners only", value=True)
     hide_upgraded = c4.checkbox("Hide already-upgraded", value=True)
 
@@ -2465,7 +2465,7 @@ def page_sonixone():
             "Street":         st.column_config.TextColumn(width="medium"),
             "City":           st.column_config.TextColumn(width="small"),
             "State":          st.column_config.TextColumn(width="small"),
-            "Owner":          st.column_config.TextColumn("PS Rep", width="medium"),
+            "Owner":          st.column_config.TextColumn("Owner", width="medium"),
             "Yrs old":        st.column_config.NumberColumn(format="%.1f", width="small"),
             "Last OSR visit": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
             "Phone":          st.column_config.TextColumn(width="medium"),
