@@ -576,8 +576,9 @@ def fmt_money(v):
     except: return "—"
 
 def fmt_date(v):
-    if not v: return "—"
-    return str(v)[:10]
+    if not _real(v): return "—"
+    s = str(v)[:10]
+    return s if s and s.lower() != "nan" else "—"
 
 def goto_detail(acct_id):
     st.session_state["selected_account_id"] = acct_id
@@ -606,7 +607,11 @@ def _safe(v, fallback=""):
         if _pd.isna(v): return fallback
     except Exception:
         pass
-    return v if isinstance(v, str) else str(v)
+    if isinstance(v, str):
+        # Catch pandas-stringified NaN sentinels like "nan"/"NaT"/"None"
+        if v.strip().lower() in ("nan","nat","none","null"): return fallback
+        return v
+    return str(v)
 
 def _num(v, fallback=None):
     """Coerce a value to float, returning fallback for None/NaN/non-numeric.
@@ -619,6 +624,42 @@ def _num(v, fallback=None):
         return float(v)
     except (TypeError, ValueError):
         return fallback
+
+def _truthy(v):
+    """Robust truthiness for SQLite columns that may be:
+      - real Python bool / int (1, True)
+      - float (NaN must NOT count as truthy, despite Python default!)
+      - TEXT '1'/'0'/'true'/'false' (SF often stores booleans as strings)
+      - None
+    Returns True only when v unambiguously represents a positive value."""
+    if v is None: return False
+    try:
+        import pandas as _pd
+        if _pd.isna(v): return False
+    except Exception:
+        pass
+    if isinstance(v, bool): return v
+    if isinstance(v, (int, float)):
+        try: return float(v) > 0
+        except (TypeError, ValueError): return False
+    s = str(v).strip().lower()
+    if s in ("1","true","yes","y","t"): return True
+    if s in ("0","false","no","n","f","","none","nan","nat","null"): return False
+    # Any other non-empty string is considered truthy (e.g. a real value like
+    # "Abdominal Cert 2023-01-15" stored in a TEXT column)
+    return True
+
+def _real(v):
+    """Returns True iff v is a real value worth rendering — not None, NaN,
+    or one of the common pandas/SF sentinel strings."""
+    if v is None: return False
+    try:
+        import pandas as _pd
+        if _pd.isna(v): return False
+    except Exception:
+        pass
+    s = str(v).strip().lower()
+    return bool(s) and s not in ("nan","nat","none","null")
 
 # ───────────────────── sidebar nav ─────────────────────
 # "Clinic detail" is intentionally NOT in this list — reps reach it by
@@ -870,7 +911,8 @@ def page_detail():
     n_opps = one("SELECT COUNT(*) AS c FROM opportunities WHERE AccountId=?", (aid,))["c"]
     rcs = acct.get("Regional_Clinical_Specialist")
     n_docs = acct.get("Number_of_Doctors")
-    n_docs_label = f"{int(n_docs)}" if n_docs else "—"
+    _nd = _num(n_docs)
+    n_docs_label = f"{int(_nd)}" if _nd and _nd > 0 else "—"
 
     def _hc(label, value):
         return (f'<div class="highlight-card"><div class="label">{_html.escape(label)}</div>'
@@ -928,38 +970,47 @@ def page_detail():
                     city_state = ', '.join([x for x in [_safe(c.get('MailingCity'),''), _safe(c.get('MailingState'),'')] if x])
                     initials = ''.join([p[0] for p in name.split() if p][:2]).upper() or '?'
 
-                    # Compliance / scoring chips
+                    # Compliance / scoring chips — guard every flag with _truthy so
+                    # TEXT '0' / NaN / 'nan' string values don't paint false-positive chips.
                     chip_html = []
-                    if c.get('No_longer_at_Company'): chip_html.append('<span class="compliance-chip cc-noatcompany">No longer at co</span>')
-                    if c.get('Primary_Contact'):     chip_html.append('<span class="compliance-chip cc-primary">PRIMARY</span>')
-                    if c.get('Contact_Confirmed'):
-                        cd = str(c.get('Confirmed_Date') or '')[:10]
-                        chip_html.append(f'<span class="compliance-chip cc-grade-A">✓ confirmed{(" " + cd) if cd else ""}</span>')
-                    if c.get('DoNotCall'):           chip_html.append('<span class="compliance-chip cc-dnc">DO NOT CALL</span>')
-                    if c.get('HasOptedOutOfEmail'): chip_html.append('<span class="compliance-chip cc-oo">opted-out email</span>')
-                    if c.get('EmailBouncedDate'):   chip_html.append(f'<span class="compliance-chip cc-bounce">bounced</span>')
+                    if _truthy(c.get('No_longer_at_Company')):
+                        chip_html.append('<span class="compliance-chip cc-noatcompany">No longer at co</span>')
+                    if _truthy(c.get('Primary_Contact')):
+                        chip_html.append('<span class="compliance-chip cc-primary">PRIMARY</span>')
+                    if _truthy(c.get('Contact_Confirmed')):
+                        cd = _safe(c.get('Confirmed_Date'), '')[:10]
+                        chip_html.append(f'<span class="compliance-chip cc-grade-A">✓ confirmed{(" " + _html.escape(cd)) if cd else ""}</span>')
+                    if _truthy(c.get('DoNotCall')):
+                        chip_html.append('<span class="compliance-chip cc-dnc">DO NOT CALL</span>')
+                    if _truthy(c.get('HasOptedOutOfEmail')):
+                        chip_html.append('<span class="compliance-chip cc-oo">opted-out email</span>')
+                    if _real(c.get('EmailBouncedDate')):
+                        chip_html.append('<span class="compliance-chip cc-bounce">bounced</span>')
                     g = _safe(c.get('pi_grade'), '')
                     if g: chip_html.append(f'<span class="compliance-chip cc-grade-{_html.escape(g[0].upper())}">Grade {_html.escape(g)}</span>')
-                    cert = _safe(c.get('Certification'), '')
-                    if cert: chip_html.append(f'<span class="compliance-chip cc-grade-A">{_html.escape(cert)}</span>')
-                    cardiac = _safe(c.get('Cardiac_Certification'), '')
-                    if cardiac: chip_html.append(f'<span class="compliance-chip cc-grade-A">Cardiac: {_html.escape(cardiac)}</span>')
+                    # Certification / Cardiac_Certification are SF TEXT '0'/'1'
+                    # in this snapshot (yes/no flags), not free-text. Render
+                    # as boolean Certified/Cardiac chips, not the literal value.
+                    if _truthy(c.get('Certification')):
+                        chip_html.append('<span class="compliance-chip cc-grade-A">Abdominal certified</span>')
+                    if _truthy(c.get('Cardiac_Certification')):
+                        chip_html.append('<span class="compliance-chip cc-grade-A">Cardiac certified</span>')
 
                     # Training milestones — Abdomen M1-M5 and Cardiac M1-M5.
-                    # Each populated date = one filled dot, NULL = empty dot.
+                    # Each populated REAL date = one filled dot. NaN/None/'nan' = empty dot.
                     abd_dates = [c.get('Abdomen_M1'), c.get('Abdomen_M2'), c.get('Abdomen_M3'),
                                  c.get('Abdominal_M4'), c.get('Abdominal_M5')]
                     car_dates = [c.get('Cardiac_M1'), c.get('Cardiac_M2'),
                                  None, None, c.get('Cardiac_M5')]  # M3/M4 not exported
                     def _milestone_dots(label, dates):
-                        filled = sum(1 for d in dates if d)
+                        filled = sum(1 for d in dates if _real(d))
                         if filled == 0: return None
-                        # Build a compact 5-dot indicator with tooltip = latest date
-                        latest = max((str(d) for d in dates if d), default='')[:10]
-                        dots = ''.join('●' if d else '○' for d in dates)
+                        real_strs = [str(d)[:10] for d in dates if _real(d)]
+                        latest = max(real_strs, default='')
+                        dots = ''.join('●' if _real(d) else '○' for d in dates)
                         return (f'<span class="compliance-chip" style="background:#E1ECF7; color:#2F567E;'
-                                f' font-family:var(--mono);" title="latest: {latest}">'
-                                f'{label} {dots} {filled}/{len([d for d in dates if d is not None or True])}</span>')
+                                f' font-family:var(--mono);" title="latest: {_html.escape(latest)}">'
+                                f'{label} {dots} {filled}/{len(dates)}</span>')
                     abd_chip = _milestone_dots("ABD", abd_dates)
                     car_chip = _milestone_dots("CARD", car_dates)
                     if abd_chip: chip_html.append(abd_chip)
@@ -1140,7 +1191,7 @@ def page_detail():
                 df_disp["Status"] = df_disp.apply(_stage_label, axis=1)
                 # Reason_Lost only meaningful for Lost opps; surface inline
                 df_disp["Why Lost"] = df_disp.apply(
-                    lambda r: _safe(r.get("Reason_Lost"), "") if r.get("StageName","").lower().find("lost") >= 0 else "",
+                    lambda r: _safe(r.get("Reason_Lost"), "") if "lost" in _safe(r.get("StageName"), "").lower() else "",
                     axis=1,
                 )
                 df_disp = df_disp[["Status", "CloseDate", "Name", "Amount", "StageName", "Type", "Sub_Type", "LeadSource", "Why Lost", "Id"]]
@@ -1379,7 +1430,8 @@ def page_detail():
                     ctyp = _safe(c.get('Contract_Type'), '')
                     status = _safe(c.get('Status'), '')
                     term = c.get('ContractTerm')
-                    term_s = f"{int(term)} mo" if term else ""
+                    _t = _num(term)
+                    term_s = f"{int(_t)} mo" if _t and _t > 0 else ""
                     company_signed = str(_safe(c.get('CompanySignedDate'), ''))[:10]
                     cust_signed    = str(_safe(c.get('CustomerSignedDate'), ''))[:10]
                     activated      = str(_safe(c.get('ActivatedDate'), ''))[:10]
@@ -1395,11 +1447,11 @@ def page_detail():
                         ("Customer signed", cust_signed),
                         ("Activated", activated),
                     ]:
-                        if val and val != "None":
+                        if val and val.lower() not in ("none","nan","nat","null"):
                             timeline_chips.append(f'<span class="chip chip-info">{label}: {_html.escape(val)}</span>')
-                    if term_s:    timeline_chips.append(f'<span class="chip chip-mute">{_html.escape(term_s)}</span>')
-                    if shipped:   timeline_chips.append('<span class="chip chip-good">Shipped</span>')
-                    if status:    timeline_chips.append(f'<span class="chip chip-info">{_html.escape(status)}</span>')
+                    if term_s:           timeline_chips.append(f'<span class="chip chip-mute">{_html.escape(term_s)}</span>')
+                    if _truthy(shipped): timeline_chips.append('<span class="chip chip-good">Shipped</span>')
+                    if status:           timeline_chips.append(f'<span class="chip chip-info">{_html.escape(status)}</span>')
 
                     detail_lines = []
                     if cust_title:  detail_lines.append(f'<b>Signed by:</b> {_html.escape(cust_title)}')
@@ -1435,13 +1487,15 @@ def page_detail():
         from datetime import datetime as _dt
 
         def _date_str(v):
-            if v is None: return ""
+            if not _real(v): return ""
             s = str(v)
+            if s.lower() == "nan": return ""
             return s[:10] if len(s) >= 10 else s
 
         def _datetime_sort(v):
-            if v is None: return "0000-00-00"
+            if not _real(v): return "0000-00-00"
             s = str(v)
+            if s.lower() == "nan": return "0000-00-00"
             return s[:19] if len(s) >= 10 else "0000-00-00"
 
         timeline_items = []  # list of dicts: kind, when, sort_key, title, meta, body, color
@@ -1693,7 +1747,7 @@ def page_detail():
                ca.CancelReason
         FROM emails e
         JOIN calendly_actions ca ON LOWER(ca.InviteeEmail) = e.em
-        ORDER BY ca.EventStartTime DESC LIMIT 200
+        ORDER BY ca.EventStartTime DESC
         """, (aid,))
         for _, r in demos_df.iterrows():
             when_raw = r.get("EventStartTime")
@@ -1740,9 +1794,9 @@ def page_detail():
             dur_s = f"{int(dur)}m" if dur and dur > 0 else ""
             rep = _safe(r.get("Sales_Rep"), "") or owner_map.get(_safe(r.get("OwnerId"),""), "")
             chips = []
-            if r.get("Calendly_IsNoShow"):     chips.append("NO-SHOW")
-            if r.get("Calendly_IsRescheduled"):chips.append("rescheduled")
-            if r.get("Demo_Completed_Date"):   chips.append("demo completed")
+            if _truthy(r.get("Calendly_IsNoShow")):     chips.append("NO-SHOW")
+            if _truthy(r.get("Calendly_IsRescheduled")):chips.append("rescheduled")
+            if _real(r.get("Demo_Completed_Date")):     chips.append("demo completed")
             meta_bits = [b for b in [etype, dur_s, loc, rep] + chips if b]
             timeline_items.append({
                 "kind": "Event",
@@ -1804,17 +1858,18 @@ def page_detail():
             cb_prio = _safe(r.get("Sonographer_Call_Back_Log_Priority"), "")
 
             chips = []
-            if r.get("STAT"): chips.append("★ STAT")
-            if urg:           chips.append(urg)
-            if prio:          chips.append(prio)
-            if status:        chips.append(status)
-            if cb_prio:       chips.append(f"CB prio: {cb_prio}")
+            is_stat = _truthy(r.get("STAT"))
+            if is_stat: chips.append("★ STAT")
+            if urg:     chips.append(urg)
+            if prio:    chips.append(prio)
+            if status:  chips.append(status)
+            if cb_prio: chips.append(f"CB prio: {cb_prio}")
             meta_bits = chips + [b for b in [scan, (pat + (f" (age {age})" if age else "") if pat else "")] if b]
             body = _safe(r.get("Description"), "")
             if aoc:    body = (f"Area of concern: {aoc}\n\n" + body).strip()
             if _safe(r.get("Notes_on_OPD"), ""):
                 body = (body + f"\n\nOPD notes: {_safe(r.get('Notes_on_OPD'), '')}").strip()
-            color = "#9C2727" if r.get("STAT") else "#3A6A9A"
+            color = "#9C2727" if is_stat else "#3A6A9A"
             timeline_items.append({
                 "kind": "Case",
                 "when": _date_str(when_raw),
@@ -1991,27 +2046,50 @@ def page_detail():
                 UNION SELECT Id FROM leads         WHERE ConvertedAccountId=?
                 UNION SELECT Id FROM assets        WHERE AccountId=? AND IsDeleted=0
                 UNION SELECT Id FROM contracts     WHERE AccountId=? AND IsDeleted=0
+            ),
+            -- Every FeedItem (post OR news_feed entry) that lives on a
+            -- clinic-related parent. Comments join HERE via FeedItemId,
+            -- not directly to the clinic.
+            clinic_feed_items AS (
+                SELECT fp.Id AS FeedItemId FROM feed_posts fp
+                  JOIN clinic_ids ci ON ci.Id = fp.ParentId
+                  WHERE fp.IsDeleted = 0
+                UNION
+                SELECT nf.Id FROM news_feed nf
+                  JOIN clinic_ids ci ON ci.Id = nf.ParentId
             )
             SELECT * FROM (
-                SELECT 'Post' AS Kind, fp.Id AS FeedId, fp.Title AS Subj, fp.Body, fp.CreatedDate AS CreatedDate,
+                SELECT 'Post' AS Kind, fp.Id AS FeedId, fp.Title AS Subj, fp.Body,
+                       fp.CreatedDate AS CreatedDate,
                        u.Name AS Author, NULL AS Field, NULL AS OldVal, NULL AS NewVal
                 FROM feed_posts fp
                 JOIN clinic_ids ci ON ci.Id = fp.ParentId
                 LEFT JOIN users u ON u.Id = fp.InsertedById
                 WHERE fp.IsDeleted = 0
                 UNION ALL
-                SELECT 'Tracked change', nf.Id, nf.Title, nf.Body, nf.CreatedDate, u.Name,
-                       ftc.FieldName, ftc.OldValue, ftc.NewValue
+                -- Tracked changes — collapse the Id/Name dup pairs SF stores
+                -- by keeping the row whose value is NOT an SF Id (15/18-char).
+                SELECT 'Tracked change', nf.Id, nf.Title, nf.Body, nf.CreatedDate,
+                       u.Name, ftc.FieldName, ftc.OldValue, ftc.NewValue
                 FROM news_feed nf
                 JOIN clinic_ids ci ON ci.Id = nf.ParentId
                 JOIN feed_tracked_change ftc ON ftc.FeedItemId = nf.Id
                 LEFT JOIN users u ON u.Id = nf.InsertedById
                 WHERE nf.Type = 'TrackedChange' AND ftc.FieldName IS NOT NULL
+                  AND NOT (
+                    (ftc.OldValue IS NOT NULL AND length(ftc.OldValue) IN (15, 18)
+                     AND ftc.OldValue GLOB '[0-9a-zA-Z][0-9a-zA-Z][0-9a-zA-Z]*')
+                    OR (ftc.NewValue IS NOT NULL AND length(ftc.NewValue) IN (15, 18)
+                        AND ftc.NewValue GLOB '[0-9a-zA-Z][0-9a-zA-Z][0-9a-zA-Z]*')
+                  )
                 UNION ALL
-                SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate, u.Name,
-                       NULL, NULL, NULL
+                -- Comments — feed_comments.ParentId is the FeedItem the comment
+                -- is on, NOT the underlying clinic record. Route via the
+                -- clinic_feed_items CTE to surface the right comments.
+                SELECT 'Comment', fc.Id, '(reply)', fc.CommentBody, fc.CreatedDate,
+                       u.Name, NULL, NULL, NULL
                 FROM feed_comments fc
-                JOIN clinic_ids ci ON ci.Id = fc.ParentId
+                JOIN clinic_feed_items cfi ON cfi.FeedItemId = fc.ParentId
                 LEFT JOIN users u ON u.Id = fc.InsertedById
                 WHERE fc.IsDeleted = 0
             )
@@ -2126,9 +2204,12 @@ def page_detail():
                 st.markdown(f":gray[**Legacy attachments** &middot; {len(att_df):,} pre-Files attachments (metadata only — binaries not in this snapshot)]")
                 disp = att_df.copy()
                 disp["When"] = disp["CreatedDate"].str.slice(0, 10)
-                disp["Size"] = disp["BodyLength"].fillna(0).apply(
-                    lambda b: f"{b/1024:,.0f} KB" if b and b < 1024*1024 else (f"{b/1024/1024:,.1f} MB" if b else "")
-                )
+                def _size_label(b):
+                    bb = _num(b)
+                    if not bb or bb <= 0: return ""
+                    if bb < 1024 * 1024:   return f"{bb/1024:,.0f} KB"
+                    return f"{bb/1024/1024:,.1f} MB"
+                disp["Size"] = disp["BodyLength"].apply(_size_label)
                 disp = disp[["When","Name","ContentType","Size","Description"]]
                 st.dataframe(
                     disp, use_container_width=True, hide_index=True,
@@ -2206,7 +2287,17 @@ def page_activity():
     )
 
     st.markdown("##### :gray[Top closed-won clinics]")
-    top = df[df["IsWon"] == 1].groupby(["AccountId", "Clinic", "State"], as_index=False)["Amount"].sum().sort_values("Amount", ascending=False).head(50)
+    # dropna=False so opps whose AccountId/Clinic/State are NULL (e.g. converted-
+    # from-lead deals whose account FK never linked back) still aggregate into
+    # an "Unknown clinic" row instead of silently dropping ~$24.5M from the
+    # leaderboard while the KPI metric above stays whole.
+    won_df = df[df["IsWon"] == 1].copy()
+    won_df["Clinic"] = won_df["Clinic"].fillna("(unknown clinic)")
+    won_df["State"]  = won_df["State"].fillna("—")
+    won_df["AccountId"] = won_df["AccountId"].fillna("")
+    top = (won_df.groupby(["AccountId", "Clinic", "State"], as_index=False, dropna=False)
+                 ["Amount"].sum()
+                 .sort_values("Amount", ascending=False).head(50))
     import html as _html
     rows_html = []
     for _, r in top.iterrows():
