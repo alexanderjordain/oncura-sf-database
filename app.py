@@ -2242,6 +2242,7 @@ def page_sonixone():
     df = q("""
     SELECT a.Id, a.Name AS Clinic,
            a.BillingState AS State, a.BillingCity AS City,
+           a.BillingStreet AS Street, a.Email AS Email,
            a.Phone, a.Hospital_ID, a.Partner, a.Past_Due,
            a.Ultrasound_System AS PrimarySystem,
            a.US_Install_Date AS PrimaryInstall,
@@ -2354,12 +2355,11 @@ def page_sonixone():
                   ("✓ Upgraded" if r.get("AlreadyUpgraded") else ""),
         axis=1,
     )
-    disp_cols = ["⚠", "Clinic", "State", "Owner", "YearsInstalled",
-                 "EarliestSonixInstall", "LastOSRVisit", "Phone"]
+    disp_cols = ["⚠", "Clinic", "Street", "City", "State", "Owner",
+                 "YearsInstalled", "LastOSRVisit", "Phone", "Email"]
     disp = disp[disp_cols].rename(columns={
-        "YearsInstalled":       "Yrs old",
-        "EarliestSonixInstall": "Install date",
-        "LastOSRVisit":         "Last OSR visit",
+        "YearsInstalled": "Yrs old",
+        "LastOSRVisit":   "Last OSR visit",
     })
     st.dataframe(
         disp, use_container_width=True, hide_index=True,
@@ -2367,12 +2367,14 @@ def page_sonixone():
         column_config={
             "⚠":              st.column_config.TextColumn(width="small"),
             "Clinic":         st.column_config.TextColumn(width="large"),
+            "Street":         st.column_config.TextColumn(width="medium"),
+            "City":           st.column_config.TextColumn(width="small"),
             "State":          st.column_config.TextColumn(width="small"),
             "Owner":          st.column_config.TextColumn("PS Rep", width="medium"),
             "Yrs old":        st.column_config.NumberColumn(format="%.1f", width="small"),
-            "Install date":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
             "Last OSR visit": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
             "Phone":          st.column_config.TextColumn(width="medium"),
+            "Email":          st.column_config.TextColumn(width="medium"),
         },
     )
 
