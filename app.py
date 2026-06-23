@@ -621,7 +621,11 @@ def _num(v, fallback=None):
         return fallback
 
 # ───────────────────── sidebar nav ─────────────────────
-PAGES = ["Clinic search", "Clinic detail", "Sales activity", "SonixOne upgrades"]
+# "Clinic detail" is intentionally NOT in this list — reps reach it by
+# clicking a clinic from search results (?clinic=<id> URL), not by sidebar
+# navigation. The router below still dispatches to page_detail() when
+# st.session_state["__page"] resolves to "Clinic detail".
+PAGES = ["Clinic search", "Sales activity", "SonixOne upgrades"]
 page = render_sidebar_nav(PAGES)
 
 # ───────────────────── PAGE: Search ─────────────────────
