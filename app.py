@@ -2490,70 +2490,75 @@ def page_sonixone():
         mime="text/csv",
     )
 
-    # In-flight deals — surface so reps don't try to re-sell what's being closed
-    in_flight_df = df[df["HSStatus"] == "in_flight"].copy()
-    if not in_flight_df.empty:
-        # Derive days-in-stage from createdate
+    # In-flight deals — surface so reps don't try to re-sell what's being closed.
+    # Guarded: if the in-flight columns are absent (e.g. older cached DB before
+    # the v18 schema lands), skip the expander entirely rather than crash.
+    try:
+        if "HSStatus" in df.columns:
+            in_flight_df = df[df["HSStatus"] == "in_flight"].copy()
+        else:
+            in_flight_df = df.iloc[0:0]
+    except Exception:
+        in_flight_df = df.iloc[0:0]
+
+    if not in_flight_df.empty and "HSDealCreated" in in_flight_df.columns:
         def _days_in_stage(s):
-            if not s or pd.isna(s): return None
             try:
+                if s is None or pd.isna(s): return None
                 d = _dt.date.fromisoformat(str(s)[:10])
                 return (_dt.date(2026,6,23) - d).days
-            except (ValueError, TypeError):
+            except Exception:
                 return None
         in_flight_df["DaysInStage"] = in_flight_df["HSDealCreated"].apply(_days_in_stage)
 
-        n_warn = int(in_flight_df["HSWarning"].notna().sum())
-        warn_chip = f' · :red[{n_warn} need attention]' if n_warn else ''
+        n_warn = int(in_flight_df.get("HSWarning", pd.Series([])).notna().sum()) if "HSWarning" in in_flight_df.columns else 0
+        warn_chip = f" ({n_warn} need attention)" if n_warn else ""
+
         with st.expander(
             f":material/local_shipping: Upgrade in flight — {len(in_flight_df)} clinics with an open Samsung/Mindray deal{warn_chip}",
             expanded=bool(n_warn),
         ):
             st.caption(":gray[Excluded from the call list above (Hide already-upgraded). Deal is live in HubSpot — coordinate with the deal owner before contacting. Stale = >180 days since deal created. Duplicate = >1 open Samsung/Mindray deal on same clinic.]")
-            disp_if = in_flight_df[[
-                "Clinic", "State", "Owner", "HSDealProduct", "HSDealStage",
-                "HSDealAmount", "DaysInStage", "HSWarning", "HSDealId",
-            ]].rename(columns={
-                "HSDealProduct":  "Product",
-                "HSDealStage":    "Stage",
-                "HSDealAmount":   "Amount",
-                "DaysInStage":    "Days open",
-                "HSWarning":      "Warning",
-                "HSDealId":       "Deal id",
+
+            # Pre-format Amount as a string ($##,###) — avoids any NumberColumn
+            # format quirks when the underlying value is None or non-numeric.
+            def _money(v):
+                try:
+                    if v is None or pd.isna(v): return ""
+                    return f"${float(v):,.0f}"
+                except Exception:
+                    return ""
+
+            disp_if = pd.DataFrame({
+                "Clinic":    in_flight_df["Clinic"].fillna(""),
+                "State":     in_flight_df.get("State", pd.Series([""]*len(in_flight_df))).fillna(""),
+                "Owner":     in_flight_df.get("Owner", pd.Series([""]*len(in_flight_df))).fillna(""),
+                "Product":   in_flight_df.get("HSDealProduct", pd.Series([""]*len(in_flight_df))).fillna(""),
+                "Stage":     in_flight_df.get("HSDealStage", pd.Series([""]*len(in_flight_df))).fillna(""),
+                "Amount":    in_flight_df.get("HSDealAmount", pd.Series([None]*len(in_flight_df))).apply(_money),
+                "Days open": in_flight_df["DaysInStage"],
+                "Warning":   in_flight_df.get("HSWarning", pd.Series([""]*len(in_flight_df))).fillna(""),
+                "Deal id":   in_flight_df.get("HSDealId", pd.Series([""]*len(in_flight_df))).fillna(""),
             })
-            # Sort: warnings first (oldest stale + duplicates surface up), then by stage proximity to close
+
+            # Sort: warnings first, then by stage proximity to close
             stage_order = {"Close (Proposal)": 0, "Prove": 1, "Prove (Demo)": 2, "Prospecting": 3}
-            disp_if["_warn_sort"] = disp_if["Warning"].isna().astype(int)  # 0 if has warning
+            disp_if["_warn_sort"]  = (disp_if["Warning"] == "").astype(int)
             disp_if["_stage_sort"] = disp_if["Stage"].map(stage_order).fillna(99)
             disp_if = disp_if.sort_values(by=["_warn_sort", "_stage_sort", "Clinic"]).drop(columns=["_warn_sort","_stage_sort"])
 
-            def _highlight_warning(row):
-                if pd.notna(row.get("Warning")):
-                    return ['background-color: rgba(255, 196, 0, 0.10)'] * len(row)
-                return [''] * len(row)
-            styled = disp_if.style.apply(_highlight_warning, axis=1)
             st.dataframe(
-                styled, use_container_width=True, hide_index=True,
+                disp_if, use_container_width=True, hide_index=True,
                 height=min(520, 60 + 36*len(disp_if)),
-                column_config={
-                    "Clinic":    st.column_config.TextColumn(width="large"),
-                    "State":     st.column_config.TextColumn(width="small"),
-                    "Owner":     st.column_config.TextColumn(width="medium"),
-                    "Product":   st.column_config.TextColumn(width="medium"),
-                    "Stage":     st.column_config.TextColumn(width="small"),
-                    "Amount":    st.column_config.NumberColumn(format="$%d", width="small"),
-                    "Days open": st.column_config.NumberColumn(width="small"),
-                    "Warning":   st.column_config.TextColumn(width="medium"),
-                    "Deal id":   st.column_config.TextColumn(width="small"),
-                },
             )
 
-            # CRM hygiene callouts — actionable warnings, separated so they're not lost in the table
-            warn_rows = in_flight_df[in_flight_df["HSWarning"].notna()]
-            if not warn_rows.empty:
+            # CRM hygiene callouts — actionable warnings, isolated so they can't be missed
+            warn_mask = disp_if["Warning"] != ""
+            if warn_mask.any():
                 st.markdown("**CRM hygiene — needs action:**")
-                for _, r in warn_rows.iterrows():
-                    st.markdown(f"- **{r['Clinic']}** ({r['Owner'] or 'no owner'}): {r['HSWarning']} — deal `{r['HSDealId']}`")
+                for _, r in disp_if[warn_mask].iterrows():
+                    owner_lbl = r["Owner"] or "no owner"
+                    st.markdown(f"- **{r['Clinic']}** ({owner_lbl}): {r['Warning']} — deal `{r['Deal id']}`")
 
     with st.expander(":gray[Open one clinic directly]"):
         if not f.empty:
