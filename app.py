@@ -2323,14 +2323,12 @@ def page_activity():
 # ───────────────────── PAGE: SonixOne upgrade radar ─────────────────────
 def page_sonixone():
     header(
-        "SonixOne upgrade radar",
-        "Clinics still running SonixOne — Oncura ends servicing on Oct 1, 2026."
+        "SonixOne upgrades",
+        "Clinics still running SonixOne."
     )
 
     import datetime as _dt
     today = _dt.date(2026, 6, 23)
-    deadline = _dt.date(2026, 10, 1)
-    days_left = (deadline - today).days
 
     # Pull every account flagged as SonixOne, plus every SonixOne asset
     # so we can show serial counts + most-recent install per clinic.
@@ -2400,19 +2398,15 @@ def page_sonixone():
     total = len(df)
     upgrade_needed = int((~df["AlreadyUpgraded"]).sum())
     still_partner = int(df["Partner"].fillna(0).astype(int).eq(1).sum())
-    past_due = int(df["Past_Due"].fillna(0).astype(int).eq(1).sum())
     units = int(df["SonixUnits"].fillna(0).sum())
 
     import html as _html
-    deadline_color = "chip-bad" if days_left < 90 else ("chip-warn" if days_left < 180 else "chip-info")
     st.markdown(
         f'<div class="chip-row">'
-        f'<span class="chip {deadline_color}">⚠ End-of-service {deadline.isoformat()} &middot; {days_left} days left</span>'
         f'<span class="chip chip-info">Clinics: {total}</span>'
-        f'<span class="chip chip-bad">Need upgrade: {upgrade_needed}</span>'
+        f'<span class="chip chip-info">Need upgrade: {upgrade_needed}</span>'
         f'<span class="chip chip-good">Already upgraded: {total - upgrade_needed}</span>'
         f'<span class="chip chip-info">Active partners: {still_partner}</span>'
-        f'<span class="chip chip-warn">Past-due partners: {past_due}</span>'
         f'<span class="chip chip-mute">Total SonixOne units: {units}</span>'
         f'</div>', unsafe_allow_html=True,
     )
@@ -2432,25 +2426,20 @@ def page_sonixone():
     if partner_only: f = f[f["Partner"].fillna(0).astype(int).eq(1)]
     if hide_upgraded: f = f[~f["AlreadyUpgraded"]]
 
-    # Sort: past-due first, then years-installed desc (oldest installs = most urgent)
+    # Sort: oldest installs first, then highest lifetime revenue
     f = f.sort_values(
-        by=["Past_Due", "YearsInstalled", "LifetimeWon"],
-        ascending=[False, False, False],
+        by=["YearsInstalled", "LifetimeWon"],
+        ascending=[False, False],
         na_position="last",
     )
 
-    st.caption(f":gray[{len(f):,} clinics meeting filters — sorted past-due first, then by install age.]")
+    st.caption(f":gray[{len(f):,} clinics meeting filters — sorted by install age (oldest first).]")
 
     # Render as a tight, call-list-ready table — required fields only.
     # Reps need: status flag, clinic name, location, who owns it, urgency
     # signal (years on platform), original install date, and phone to dial.
     disp = f.copy()
-    disp["⚠"] = disp.apply(
-        lambda r: "★ Past Due" if r.get("Past_Due") == 1 else
-                  ("✓ Upgraded" if r.get("AlreadyUpgraded") else ""),
-        axis=1,
-    )
-    disp_cols = ["⚠", "Clinic", "Street", "City", "State", "Owner",
+    disp_cols = ["Clinic", "Street", "City", "State", "Owner",
                  "YearsInstalled", "LastOSRVisit", "Phone", "Email"]
     disp = disp[disp_cols].rename(columns={
         "YearsInstalled": "Yrs old",
@@ -2460,7 +2449,6 @@ def page_sonixone():
         disp, use_container_width=True, hide_index=True,
         height=min(640, 60 + 36*len(disp)),
         column_config={
-            "⚠":              st.column_config.TextColumn(width="small"),
             "Clinic":         st.column_config.TextColumn(width="large"),
             "Street":         st.column_config.TextColumn(width="medium"),
             "City":           st.column_config.TextColumn(width="small"),
