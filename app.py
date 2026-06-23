@@ -2355,22 +2355,24 @@ def page_sonixone():
         axis=1,
     )
     disp_cols = ["⚠", "Clinic", "State", "Owner", "YearsInstalled",
-                 "EarliestSonixInstall", "Phone"]
+                 "EarliestSonixInstall", "LastOSRVisit", "Phone"]
     disp = disp[disp_cols].rename(columns={
         "YearsInstalled":       "Yrs old",
         "EarliestSonixInstall": "Install date",
+        "LastOSRVisit":         "Last OSR visit",
     })
     st.dataframe(
         disp, use_container_width=True, hide_index=True,
         height=min(640, 60 + 36*len(disp)),
         column_config={
-            "⚠":            st.column_config.TextColumn(width="small"),
-            "Clinic":       st.column_config.TextColumn(width="large"),
-            "State":        st.column_config.TextColumn(width="small"),
-            "Owner":        st.column_config.TextColumn("PS Rep", width="medium"),
-            "Yrs old":      st.column_config.NumberColumn(format="%.1f", width="small"),
-            "Install date": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
-            "Phone":        st.column_config.TextColumn(width="medium"),
+            "⚠":              st.column_config.TextColumn(width="small"),
+            "Clinic":         st.column_config.TextColumn(width="large"),
+            "State":          st.column_config.TextColumn(width="small"),
+            "Owner":          st.column_config.TextColumn("PS Rep", width="medium"),
+            "Yrs old":        st.column_config.NumberColumn(format="%.1f", width="small"),
+            "Install date":   st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+            "Last OSR visit": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"),
+            "Phone":          st.column_config.TextColumn(width="medium"),
         },
     )
 
