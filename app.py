@@ -2344,11 +2344,24 @@ def page_sonixone():
 
     # Already-upgraded = clinic has both SonixOne AND another system on file
     df["AlreadyUpgraded"] = df["NonSonixUnits"].fillna(0) > 0
-    df["YearsInstalled"] = df.apply(
-        lambda r: (round((_dt.date(2026,6,23) - _dt.date.fromisoformat(str(r.get("EarliestSonixInstall") or r.get("PrimaryInstall") or "1900-01-01")[:10])).days/365.25, 1)
-                   if (r.get("EarliestSonixInstall") or r.get("PrimaryInstall")) else None),
-        axis=1,
-    )
+
+    def _years_installed(row):
+        for col in ("EarliestSonixInstall", "PrimaryInstall"):
+            v = row.get(col)
+            if v is None: continue
+            try:
+                if pd.isna(v): continue
+            except Exception:
+                pass
+            s = str(v).strip()
+            if not s or s.lower() == "nan" or len(s) < 10: continue
+            try:
+                d = _dt.date.fromisoformat(s[:10])
+                return round((_dt.date(2026,6,23) - d).days / 365.25, 1)
+            except ValueError:
+                continue
+        return None
+    df["YearsInstalled"] = df.apply(_years_installed, axis=1)
 
     # Header KPI strip
     total = len(df)
